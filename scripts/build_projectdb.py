@@ -50,16 +50,22 @@ def main() -> int:
             run_sql_script(cur, SQL_DIR / "create_tables.sql")
         conn.commit()
 
-        copy_statements = (SQL_DIR / "import_data.sql").read_text().splitlines()
-
+        # Each COPY statement is multi-line, so split on `;` (after stripping
+        # comment-only lines) rather than per newline.
+        sql_text = (SQL_DIR / "import_data.sql").read_text()
+        sql_no_comments = "\n".join(
+            line for line in sql_text.splitlines()
+            if not line.lstrip().startswith("--")
+        )
         copy_statements = [
-            ln for ln in copy_statements
-            if ln.strip() and not ln.lstrip().startswith("--")
+            stmt.strip()
+            for stmt in sql_no_comments.split(";")
+            if stmt.strip()
         ]
         if len(copy_statements) < 2:
             sys.exit(
-                "ERROR: import_data.sql is missing the expected 2 COPY lines "
-                "(transactions, laundering_patterns)."
+                "ERROR: import_data.sql is missing the expected 2 COPY "
+                "statements (transactions, laundering_patterns)."
             )
 
         with conn.cursor() as cur:
