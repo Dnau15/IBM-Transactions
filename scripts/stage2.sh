@@ -19,6 +19,11 @@ chmod +x scripts/run_eda.sh
 [[ "${SKIP_AVSC:-0}"     == "1" ]] || ./scripts/upload_avsc.sh
 
 if [[ "${SKIP_ACCOUNTS:-0}" != "1" ]]; then
+    # Stage the CSV onto HDFS so YARN executors can read it in parallel.
+    # Idempotent: -put -f overwrites if it already exists.
+    hdfs dfs -mkdir -p /user/team1/data
+    hdfs dfs -put -f data/accounts.csv /user/team1/data/accounts.csv
+
     # Use the cluster's system Python (3.6) which ships pyspark 3.2.4 in
     # /usr/local/lib/python3.6/site-packages/. Activating .venv311 (3.11)
     # masks that pyspark and makes spark-submit fall back to an older

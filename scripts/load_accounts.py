@@ -11,8 +11,11 @@ import sys
 from pyspark.sql import SparkSession
 
 
+# Both paths are on HDFS — Spark runs on YARN, so the executors must
+# read the CSV from a distributed filesystem they can all see. The CSV
+# is staged to /user/team1/data/ by stage2.sh before this script runs.
+HDFS_CSV = "/user/team1/data/accounts.csv"
 HDFS_PATH = "/user/team1/project/warehouse/accounts"
-LOCAL_CSV = "data/accounts.csv"
 
 
 def normalise(col: str) -> str:
@@ -31,7 +34,7 @@ def main():
     df = (spark.read
           .option("header", True)
           .option("inferSchema", True)
-          .csv(LOCAL_CSV))
+          .csv(HDFS_CSV))
 
     renamed = df.toDF(*[normalise(c) for c in df.columns])
     print(f"[load_accounts] columns: {renamed.columns}")
