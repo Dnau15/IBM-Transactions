@@ -19,8 +19,11 @@ chmod +x scripts/run_eda.sh
 [[ "${SKIP_AVSC:-0}"     == "1" ]] || ./scripts/upload_avsc.sh
 
 if [[ "${SKIP_ACCOUNTS:-0}" != "1" ]]; then
-    # accounts.py uses cluster-bundled pyspark; no pip install required here.
-    source .venv311/bin/activate
+    # Use the cluster's system Python (3.6) which ships pyspark 3.2.4 in
+    # /usr/local/lib/python3.6/site-packages/. Activating .venv311 (3.11)
+    # masks that pyspark and makes spark-submit fall back to an older
+    # /usr/lib/spark install whose cloudpickle is incompatible with 3.11.
+    unset PYSPARK_PYTHON PYSPARK_DRIVER_PYTHON VIRTUAL_ENV
     spark-submit --master yarn --deploy-mode client scripts/load_accounts.py
 fi
 
