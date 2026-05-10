@@ -19,9 +19,8 @@ chmod +x scripts/run_eda.sh
 [[ "${SKIP_AVSC:-0}"     == "1" ]] || ./scripts/upload_avsc.sh
 
 if [[ "${SKIP_ACCOUNTS:-0}" != "1" ]]; then
+    # accounts.py uses cluster-bundled pyspark; no pip install required here.
     source .venv311/bin/activate
-    pip install -q -U pip
-    pip install -q -r requirements.txt
     spark-submit --master yarn --deploy-mode client scripts/load_accounts.py
 fi
 
@@ -29,11 +28,20 @@ fi
 [[ "${SKIP_EDA:-0}"      == "1" ]] || ./scripts/run_eda.sh
 
 if [[ "${RUN_PLOTS:-1}" == "1" && "${SKIP_PLOTS:-0}" != "1" ]]; then
-    if .venv311/bin/python -c "import matplotlib" 2>/dev/null; then
+    # Try plots; if matplotlib/pandas can't be imported, attempt a pip
+    # install (pinned versions ship manylinux2014 wheels for cluster glibc).
+    # Fail-soft: if install can't satisfy on this host, the Superset .jpg
+    # exports remain the primary chart deliverable per spec.
+    if .venv311/bin/python -c "import matplotlib, pandas" 2>/dev/null; then
         .venv311/bin/python scripts/eda_plot.py
     else
-        echo "[stage2] matplotlib not available; skipping eda_plot.py"
-        echo "[stage2] (run pip install -r requirements.txt to enable)"
+        echo "[stage2] plot deps missing — attempting install ..."
+        if .venv311/bin/pip install -q -r requirements.txt; then
+            .venv311/bin/python scripts/eda_plot.py
+        else
+            echo "[stage2] WARNING: plot deps could not be installed; skipping mpl backups"
+            echo "[stage2] (Superset chart exports at output/qN.jpg remain the primary deliverable)"
+        fi
     fi
 fi
 
