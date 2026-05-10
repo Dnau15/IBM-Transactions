@@ -21,6 +21,17 @@ export WITH_BENCH
 chmod +x scripts/stage1.sh scripts/stage2.sh
 
 ./scripts/stage1.sh
+
+# Free the ~25 GB the benchmark sweep ate on HDFS. The format/codec
+# numbers were already captured in output/format_benchmark.csv and the
+# plots; the HDFS imports themselves are not consumed downstream. Skip
+# this cleanup if benchmark wasn't run (we'd be deleting someone else's
+# results — possibly from a previous --with-bench run we want to keep).
+if [[ "$WITH_BENCH" == "1" ]]; then
+    echo "[main] cleaning up /user/team1/project/benchmark (~25 GB)"
+    hdfs dfs -rm -r -f -skipTrash /user/team1/project/benchmark || true
+fi
+
 ./scripts/stage2.sh
 
 echo "[main] all stages complete."

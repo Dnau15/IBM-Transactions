@@ -5,14 +5,20 @@
 # warehouse that YARN executors can't write to.
 set -euo pipefail
 
-PASSWORD=$(head -n1 secrets/.psql.pass)
 HS2_URL="jdbc:hive2://hadoop-03.uni.innopolis.ru:10001"
 LOG="output/hive_build.log"
 
 mkdir -p output
 
+# Stage password into a tmpfile for beeline `-w` (avoids the `-p`
+# form's password leak through /proc/$pid/cmdline).
+PWDFILE=$(mktemp)
+chmod 600 "$PWDFILE"
+head -n1 secrets/.psql.pass | tr -d '\n' > "$PWDFILE"
+trap 'rm -f "$PWDFILE"' EXIT
+
 echo "[build_hive_db] running sql/db.hql via beeline ..."
-if ! beeline -u "$HS2_URL" -n team1 -p "$PASSWORD" \
+if ! beeline -u "$HS2_URL" -n team1 -w "$PWDFILE" \
         --hiveconf hive.execution.engine=tez \
         -f sql/db.hql > "$LOG" 2>&1; then
     echo "[build_hive_db] beeline failed; see $LOG (last 40 lines):"
