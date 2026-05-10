@@ -10,11 +10,8 @@ SET hive.exec.dynamic.partition.mode=nonstrict;
 SET hive.exec.max.dynamic.partitions=1000;
 SET hive.exec.max.dynamic.partitions.pernode=200;
 SET hive.enforce.bucketing=true;
--- Cluster default JVM TZ is MSK (UTC+3); without this, CAST(string -> TIMESTAMP)
--- on naive Postgres timestamps shifts dates at the day boundary (Sept 1 00:00
--- becomes Aug 31 21:00 UTC, falling into the wrong partition). Force UTC so
--- the date extraction matches the source strings byte-for-byte.
-SET hive.local.time.zone=UTC;
+-- (`hive.local.time.zone` is inert for BIGINT→TIMESTAMP casts in Hive 3.x —
+-- we handle the TZ shift explicitly in the INSERT below instead.)
 
 DROP DATABASE IF EXISTS team1_projectdb CASCADE;
 CREATE DATABASE team1_projectdb LOCATION 'project/hive/warehouse';
@@ -72,10 +69,16 @@ CLUSTERED BY (from_bank) INTO 16 BUCKETS
 STORED AS PARQUET
 TBLPROPERTIES ('parquet.compression'='SNAPPY');
 
+-- The AVRO `timestamp` field is plain BIGINT (epoch millis), encoded by
+-- Sqoop using the cluster JVM's MSK timezone — i.e., "2022-09-01 00:00:00"
+-- from Postgres became 1661979600000 ms (Sept 1 00:00 MSK = Aug 31 21:00 UTC).
+-- Hive's CAST(BIGINT → TIMESTAMP) interprets the long in UTC and produces
+-- "Aug 31 21:00", which falls into the wrong DATE partition. Compensate by
+-- adding 3 hours (10,800,000 ms) before extracting the date.
 INSERT OVERWRITE TABLE transactions PARTITION (txn_date)
 SELECT
     txn_id,
-    CAST(`timestamp` AS TIMESTAMP)              AS ts,
+    CAST(`timestamp` + 10800000 AS TIMESTAMP)   AS ts,
     from_bank,
     from_account,
     to_bank,
@@ -86,7 +89,8 @@ SELECT
     payment_currency,
     payment_format,
     CAST(is_laundering AS INT)                  AS is_laundering,
-    CAST(CAST(`timestamp` AS TIMESTAMP) AS DATE) AS txn_date
+    DATE_ADD('1970-01-01',
+             CAST((`timestamp` + 10800000) DIV 86400000 AS INT)) AS txn_date
 FROM transactions_raw;
 
 -- ---------- Patterns table (managed Parquet, no partitioning) ----------
@@ -117,7 +121,7 @@ SELECT
     pattern_id,
     pattern_group,
     pattern_type,
-    CAST(`timestamp` AS TIMESTAMP)              AS ts,
+    CAST(`timestamp` + 10800000 AS TIMESTAMP)   AS ts,   -- same +3h MSK shift as transactions
     from_bank,
     from_account,
     to_bank,
