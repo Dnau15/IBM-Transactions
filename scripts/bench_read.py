@@ -6,8 +6,10 @@ Usage: spark-submit bench_read.py <format> <hdfs_path>
 
 Loads the dataset, forces materialisation via .count(), and prints the
 elapsed seconds on the LAST stdout line so the bash driver can tail it.
+
+NOTE: cluster Spark ships with Python 3.6 — do not use 3.7+ syntax
+(e.g. `from __future__ import annotations`, `X | Y` unions, walrus, etc.).
 """
-from __future__ import annotations
 
 import sys
 import time
