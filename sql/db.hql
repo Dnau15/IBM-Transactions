@@ -31,8 +31,17 @@ LOCATION 'project/warehouse/laundering_patterns'
 TBLPROPERTIES ('avro.schema.url'='project/warehouse/avsc/laundering_patterns.avsc');
 
 -- accounts.csv was loaded directly to Parquet by scripts/load_accounts.py
--- (no Sqoop / AVRO bridge — it's a one-shot CSV import).
-CREATE EXTERNAL TABLE accounts
+-- (no Sqoop / AVRO bridge — it's a one-shot CSV import). Column list
+-- declared explicitly because spark-sql refuses to infer a schema from
+-- the Parquet files at CREATE TABLE time; this matches the StructType
+-- in scripts/load_accounts.py.
+CREATE EXTERNAL TABLE accounts (
+    bank_name      STRING,
+    bank_id        BIGINT,
+    account_number STRING,
+    entity_id      STRING,
+    entity_name    STRING
+)
 STORED AS PARQUET
 LOCATION 'project/warehouse/accounts';
 
