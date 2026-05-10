@@ -2,10 +2,11 @@ secrets/*
 !secrets/.gitkeep
 !secrets/.psql.pass.example
 .env
-
+.DS_Store
 data/*
 !data/.gitkeep
-
+report/
+project_reqs/
 __pycache__/
 *.pyc
 *.pyo
