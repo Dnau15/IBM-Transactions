@@ -4,6 +4,7 @@ secrets/*
 .env
 .DS_Store
 data/*
+output/*
 !data/.gitkeep
 report/
 project_reqs/
@@ -16,6 +17,14 @@ __pycache__/
 output/_logs/
 output/_SUCCESS
 output/sqoop-*.log
+
+# Stage II EDA artifacts — reproducible from sql/q*.hql + scripts/eda_plot.py
+output/q[1-9].csv
+output/q[1-9].jpg
+output/q[1-9]_mpl.jpg
+output/q[1-9]_run.log
+output/hive_build.log
+output/bench_read_*.{out,err}
 
 *.avsc
 *.java

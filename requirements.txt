@@ -1,2 +1,4 @@
 psycopg2-binary>=2.9
 kaggle>=1.6
+matplotlib>=3.7
+pandas>=2.0
