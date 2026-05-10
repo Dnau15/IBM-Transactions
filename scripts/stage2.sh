@@ -44,7 +44,9 @@ if [[ "${RUN_PLOTS:-1}" == "1" && "${SKIP_PLOTS:-0}" != "1" ]]; then
         .venv311/bin/python scripts/eda_plot.py
     else
         echo "[stage2] plot deps missing — attempting install ..."
-        if .venv311/bin/pip install -q -r requirements.txt; then
+        # --prefer-binary tells pip to pick older versions that ship
+        # wheels rather than the newest that needs a C++ compiler.
+        if .venv311/bin/pip install -q --prefer-binary -r requirements.txt; then
             .venv311/bin/python scripts/eda_plot.py
         else
             echo "[stage2] WARNING: plot deps could not be installed; skipping mpl backups"
