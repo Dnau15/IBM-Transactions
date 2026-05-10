@@ -76,17 +76,25 @@ def main() -> int:
         conn.commit()
 
         print("[build_projectdb] verification queries:")
+        test_sql = (SQL_DIR / "test_database.sql").read_text()
+        test_sql_no_comments = "\n".join(
+            line for line in test_sql.splitlines()
+            if not line.lstrip().startswith("--")
+        )
+        test_statements = [
+            stmt.strip()
+            for stmt in test_sql_no_comments.split(";")
+            if stmt.strip()
+        ]
         with conn.cursor() as cur:
-            for cmd in (SQL_DIR / "test_database.sql").read_text().splitlines():
-                cmd = cmd.strip()
-                if not cmd or cmd.startswith("--"):
-                    continue
+            for cmd in test_statements:
                 cur.execute(cmd)
                 try:
                     rows = cur.fetchall()
                 except psql.ProgrammingError:
                     continue
-                print(f"  > {cmd[:80]}{'...' if len(cmd) > 80 else ''}")
+                preview = " ".join(cmd.split())
+                print(f"  > {preview[:80]}{'...' if len(preview) > 80 else ''}")
                 pprint(rows, indent=4, width=120)
 
     print("[build_projectdb] done.")
