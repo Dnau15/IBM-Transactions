@@ -118,7 +118,7 @@ run_one() {
 
     if spark-submit \
             --master yarn --deploy-mode client \
-            --packages org.apache.spark:spark-avro_2.12:3.2.0 \
+            --packages org.apache.spark:spark-avro_2.12:3.2.4 \
             scripts/bench_read.py "$fmt" "/user/${TEAM}/${dest}" \
             >"$out_log" 2>"$err_log"; then
         read_s=$(tail -n1 "$out_log" | tr -d '[:space:]')
