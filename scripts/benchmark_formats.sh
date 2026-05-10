@@ -4,7 +4,8 @@
 # Spark read time, and a status column.
 #
 # Resumable: if an HDFS target directory already has _SUCCESS, sqoop is
-# skipped and only the read measurement runs (write_seconds = "cached").
+# skipped and the prior run's write_seconds (if any) is carried forward
+# from the existing CSV; otherwise the cell is "cached" as a fallback.
 # Set RESET=1 to wipe HDFS benchmark dirs and start fresh.
 set -uo pipefail
 
@@ -32,6 +33,21 @@ if [[ "${RESET:-0}" == "1" ]]; then
 fi
 
 hdfs dfs -mkdir -p "/user/${TEAM}/${BENCH_BASE}"
+
+# Carry-forward: load any numeric write_seconds from the existing CSV before
+# we truncate it, so a "cached" sqoop run preserves the original write time.
+declare -A PRIOR_WRITE
+if [[ -s "$OUT_CSV" ]]; then
+    while IFS=, read -r f c _eff w _rest; do
+        [[ "$f" == "format" || -z "$f" ]] && continue
+        if [[ "$w" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            PRIOR_WRITE["${f}_${c}"]="$w"
+        fi
+    done < "$OUT_CSV"
+    if (( ${#PRIOR_WRITE[@]} > 0 )); then
+        echo "[bench] carrying forward ${#PRIOR_WRITE[@]} prior write_seconds value(s) from $OUT_CSV"
+    fi
+fi
 
 echo "format,codec,effective_codec,write_seconds,size_bytes,read_seconds,status" > "$OUT_CSV"
 
@@ -85,7 +101,7 @@ run_one() {
     # Resumable: skip sqoop if a successful import already lives here.
     if hdfs dfs -test -e "/user/${TEAM}/${dest}/_SUCCESS" 2>/dev/null; then
         echo "[bench] /user/${TEAM}/${dest}/_SUCCESS exists — skipping sqoop import"
-        write_s="cached"
+        write_s="${PRIOR_WRITE[${fmt}_${codec}]:-cached}"
     else
         # Clean any partial state from a previously failed run.
         hdfs dfs -rm -r -f -skipTrash "/user/${TEAM}/${dest}" || true
