@@ -23,8 +23,6 @@ else
     done
 fi
 
-unset PYSPARK_PYTHON PYSPARK_DRIVER_PYTHON VIRTUAL_ENV
-
 for q in "${files[@]}"; do
     name=$(basename "$q" .hql)
     log="output/${name}_run.log"
@@ -34,10 +32,12 @@ for q in "${files[@]}"; do
     echo "[run_eda] $name : $q"
     echo "=========================================================="
 
-    if ! spark-sql \
-            --master yarn --deploy-mode client \
-            --conf spark.sql.catalogImplementation=hive \
-            --conf hive.metastore.uris=thrift://hadoop-02.uni.innopolis.ru:9883 \
+    # Run the .hql via beeline so DDL hits HiveServer2's metastore (the
+    # same one build_hive_db.sh used). spark-sql can't auto-discover the
+    # HMS on this cluster — using it here would create qN_results in a
+    # local catalog beeline can't see.
+    if ! beeline -u "$HS2_URL" -n team1 -p "$PASSWORD" \
+            --hiveconf hive.execution.engine=tez \
             -f "$q" > "$log" 2>&1; then
         echo "[run_eda] $name DDL FAILED — see $log"
         tail -20 "$log"
