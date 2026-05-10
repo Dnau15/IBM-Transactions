@@ -10,6 +10,11 @@ SET hive.exec.dynamic.partition.mode=nonstrict;
 SET hive.exec.max.dynamic.partitions=1000;
 SET hive.exec.max.dynamic.partitions.pernode=200;
 SET hive.enforce.bucketing=true;
+-- Cluster default JVM TZ is MSK (UTC+3); without this, CAST(string -> TIMESTAMP)
+-- on naive Postgres timestamps shifts dates at the day boundary (Sept 1 00:00
+-- becomes Aug 31 21:00 UTC, falling into the wrong partition). Force UTC so
+-- the date extraction matches the source strings byte-for-byte.
+SET hive.local.time.zone=UTC;
 
 DROP DATABASE IF EXISTS team1_projectdb CASCADE;
 CREATE DATABASE team1_projectdb LOCATION 'project/hive/warehouse';

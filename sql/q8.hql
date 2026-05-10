@@ -1,44 +1,42 @@
--- q8: Consortium coverage curve. For K members ∈ {3, 5, 10, 20}, count
--- transactions where BOTH endpoints are within the top-K banks (proper
--- consortium semantics — boundary transactions to non-members don't
--- count). Output also has the totals so plotting can derive ratios.
+-- q8: Per-bank laundering metrics. Joins the accounts dim table (loaded
+-- via scripts/load_accounts.py) to attach a human-readable bank name to
+-- each bank_id seen in transactions. Plots downstream sort this by
+-- laundering_ratio (DESC for top-risk banks; ASC for cleanest banks).
 USE team1_projectdb;
 DROP TABLE IF EXISTS q8_results;
+
 CREATE TABLE q8_results AS
-WITH bank_volume AS (
-    SELECT bank, SUM(c) AS volume
-    FROM (
-        SELECT from_bank AS bank, COUNT(*) AS c FROM transactions GROUP BY from_bank
-        UNION ALL
-        SELECT to_bank   AS bank, COUNT(*) AS c FROM transactions GROUP BY to_bank
-    ) legs
-    GROUP BY bank
+WITH bank_names AS (
+    -- Multiple accounts per bank in accounts.csv; take any name per bank_id.
+    SELECT bank_id, MIN(bank_name) AS bank_name
+    FROM accounts
+    GROUP BY bank_id
 ),
-ranked AS (
-    SELECT bank, ROW_NUMBER() OVER (ORDER BY volume DESC) AS rank
-    FROM bank_volume
+out_m AS (
+    SELECT from_bank             AS bank_id,
+           COUNT(*)              AS out_transactions,
+           SUM(is_laundering)    AS out_laundering
+    FROM transactions
+    GROUP BY from_bank
 ),
-joined AS (
-    SELECT
-        t.is_laundering,
-        fr.rank AS from_rank,
-        tr.rank AS to_rank
-    FROM transactions t
-    LEFT JOIN ranked fr ON t.from_bank = fr.bank
-    LEFT JOIN ranked tr ON t.to_bank   = tr.bank
-),
-ks AS (
-    SELECT 3 AS k UNION ALL SELECT 5 UNION ALL SELECT 10 UNION ALL SELECT 20
+in_m AS (
+    SELECT to_bank               AS bank_id,
+           COUNT(*)              AS in_transactions,
+           SUM(is_laundering)    AS in_laundering
+    FROM transactions
+    GROUP BY to_bank
 )
 SELECT
-    ks.k                                                       AS k,
-    SUM(CASE WHEN j.from_rank <= ks.k AND j.to_rank <= ks.k
-             THEN 1 ELSE 0 END)                                 AS tx_in_consortium,
-    COUNT(*)                                                    AS tx_total,
-    SUM(CASE WHEN j.from_rank <= ks.k AND j.to_rank <= ks.k
-                  AND j.is_laundering = 1 THEN 1 ELSE 0 END)    AS laundering_in_consortium,
-    SUM(j.is_laundering)                                        AS laundering_total
-FROM joined j
-CROSS JOIN ks
-GROUP BY ks.k
-ORDER BY ks.k;
+    COALESCE(o.bank_id, i.bank_id)                                AS bank_id,
+    bn.bank_name                                                  AS name,
+    COALESCE(i.in_transactions, 0)                                AS in_transactions,
+    COALESCE(o.out_transactions, 0)                               AS out_transactions,
+    ROUND(
+        (COALESCE(o.out_laundering, 0) + COALESCE(i.in_laundering, 0)) * 1.0
+        / NULLIF(COALESCE(o.out_transactions, 0) + COALESCE(i.in_transactions, 0), 0),
+        6
+    )                                                             AS laundering_ratio
+FROM out_m o
+FULL OUTER JOIN in_m i ON o.bank_id = i.bank_id
+LEFT JOIN bank_names bn ON bn.bank_id = COALESCE(o.bank_id, i.bank_id)
+ORDER BY laundering_ratio DESC;

@@ -34,7 +34,7 @@ declare -A HEADERS=(
     [q5]="account,out_deg,in_deg,ever_laundering"
     [q6]="pattern_type,n_patterns,n_transactions"
     [q7]="from_bank,to_bank,n,laundering_n"
-    [q8]="k,tx_in_consortium,tx_total,laundering_in_consortium,laundering_total"
+    [q8]="bank_id,name,in_transactions,out_transactions,laundering_ratio"
     [q9]="n_banks,n_patterns"
 )
 
