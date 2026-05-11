@@ -1,0 +1,244 @@
+"""Stage III — train model1 (LogisticRegression, classical) and model2
+(GBTClassifier, non-classical / boosting).
+
+Each model is:
+    * fit on the training split with class-weighted loss + negative
+      downsampling on the training set ONLY (val/test untouched);
+    * hyperparameter-optimized via ParamGridBuilder + CrossValidator
+      (k=3 folds, ≥3 model hyperparameters per the course rubric);
+    * persisted to project/models/modelN on HDFS;
+    * scored on the held-out test split → predictions CSV at
+      project/output/modelN_predictions/.
+
+Usage:
+    spark-submit --master yarn --deploy-mode client \
+        --py-files scripts/spark_session.py,scripts/build_features.py \
+        scripts/train_models.py --model lr     # → model1
+    spark-submit ... scripts/train_models.py --model gbt    # → model2
+
+Why class weighting + downsampling combined?
+    HI-Medium has ≈0.1% positive rate. Pure class weights (pos_weight ≈
+    1000) destabilize gradient-based learners; pure downsampling throws
+    away majority-class signal at extreme ratios. Following ml.md §5:
+    downsample negatives to ~1:50, then set the positive class weight
+    to ~50 so the loss is approximately balanced. Validation and test
+    keep the original imbalance — reported metrics reflect deployment
+    operating regime, not a training shortcut.
+"""
+import argparse
+import sys
+
+from pyspark.ml.classification import GBTClassifier, LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.sql import functions as F
+
+from spark_session import build_session
+
+
+HDFS_TRAIN = "project/data/train_parquet"
+HDFS_TEST = "project/data/test_parquet"
+
+# Target ratio after downsampling negatives (positives kept intact).
+# 1:50 keeps enough majority signal for gradient stability without
+# inflating training time. With ~25M train rows at 0.1% positive rate
+# that's ~25k positives → ~1.25M downsampled negatives.
+TARGET_NEG_PER_POS = 50
+
+# Cross-validation folds. The course requires k>2; 3 is the minimum that
+# satisfies the rubric without 5× the training cost.
+CV_FOLDS = 3
+
+# Reproducibility.
+SEED = 42
+
+
+# -----------------------------------------------------------------------------
+# Class-imbalance handling
+# -----------------------------------------------------------------------------
+
+def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEED):
+    """Downsample negatives on the train split and attach a `weight` column.
+
+    The weight column is then passed to the classifier via `weightCol="weight"`
+    so the loss is approximately class-balanced even after downsampling.
+    """
+    pos = train.filter(F.col("label") == 1).cache()
+    neg = train.filter(F.col("label") == 0).cache()
+    n_pos, n_neg = pos.count(), neg.count()
+    if n_pos == 0:
+        raise RuntimeError("train split has zero positive examples — "
+                           "either the temporal cutoff is wrong or all "
+                           "laundering rows live in the test window")
+
+    # Sample negatives to target ratio. Cap fraction at 1.0 in the
+    # (unlikely) case the dataset is already balanced.
+    target_neg = n_pos * target_neg_per_pos
+    frac = min(1.0, target_neg / n_neg) if n_neg else 0.0
+    neg_sampled = neg.sample(withReplacement=False, fraction=frac, seed=seed)
+
+    n_neg_sampled = neg_sampled.count()
+    print(f"[train_models] pre-downsample : pos={n_pos:,}  neg={n_neg:,}")
+    print(f"[train_models] post-downsample: pos={n_pos:,}  neg={n_neg_sampled:,}  "
+          f"frac={frac:.6f}")
+
+    # Class weight: balanced loss after downsampling.
+    # pos_weight ≈ neg/pos so positive errors contribute equally to gradient.
+    pos_weight = n_neg_sampled / n_pos
+    pos = pos.withColumn("weight", F.lit(float(pos_weight)))
+    neg_sampled = neg_sampled.withColumn("weight", F.lit(1.0))
+
+    balanced = pos.union(neg_sampled)
+    # Shuffle so positives don't all live in the same partitions — important
+    # for distributed training stability on Spark.
+    return balanced.orderBy(F.rand(seed=seed))
+
+
+# -----------------------------------------------------------------------------
+# Model definitions
+# -----------------------------------------------------------------------------
+
+def build_logreg():
+    """model1 — LogisticRegression (classical).
+
+    Three model hyperparameters in the grid (per rubric):
+        regParam        — L2 strength
+        elasticNetParam — L1/L2 mix (0 = pure L2, 1 = pure L1)
+        aggregationDepth — tree-aggregation depth (per tutorial example)
+    """
+    lr = LogisticRegression(
+        labelCol="label",
+        featuresCol="features",
+        weightCol="weight",
+        maxIter=100,        # not in grid — sufficient for convergence
+        family="binomial",
+        standardization=True,
+    )
+    grid = (
+        ParamGridBuilder()
+        .addGrid(lr.regParam, [0.001, 0.01, 0.1])
+        .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+        .addGrid(lr.aggregationDepth, [2, 4])
+        .build()
+    )
+    return lr, grid
+
+
+def build_gbt():
+    """model2 — GBTClassifier (non-classical / boosting).
+
+    Three model hyperparameters in the grid (per rubric — all are
+    structural model parameters, not training-control like maxIter):
+        maxDepth         — depth of each weak learner
+        stepSize         — boosting learning rate
+        subsamplingRate  — stochastic boosting fraction
+    """
+    gbt = GBTClassifier(
+        labelCol="label",
+        featuresCol="features",
+        weightCol="weight",
+        maxIter=50,         # fixed — controls #trees, not in grid (training param)
+        seed=SEED,
+    )
+    grid = (
+        ParamGridBuilder()
+        .addGrid(gbt.maxDepth, [3, 5, 7])
+        .addGrid(gbt.stepSize, [0.05, 0.1])
+        .addGrid(gbt.subsamplingRate, [0.7, 1.0])
+        .build()
+    )
+    return gbt, grid
+
+
+MODELS = {
+    "lr":  ("model1", build_logreg),
+    "gbt": ("model2", build_gbt),
+}
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True, choices=list(MODELS),
+                        help="lr -> LogisticRegression (model1, classical); "
+                             "gbt -> GBTClassifier (model2, non-classical)")
+    args = parser.parse_args()
+    model_dir, builder = MODELS[args.model]
+
+    spark = build_session(f"train_{args.model}")
+
+    # 1. Load splits (Parquet preserves the features Vector type).
+    train = spark.read.parquet(HDFS_TRAIN)
+    test = spark.read.parquet(HDFS_TEST)
+
+    # 2. Downsample negatives + attach class weights on train only.
+    train_balanced = downsample_and_weight(train)
+
+    # 3. Build estimator + hyperparameter grid.
+    estimator, grid = builder()
+    n_combos = len(grid)
+    print(f"[train_models] {args.model}: grid size = {n_combos} "
+          f"× {CV_FOLDS} folds = {n_combos * CV_FOLDS} fits")
+
+    # 4. CrossValidator — optimizes PR-AUC on the train fold, not ROC-AUC.
+    #    PR-AUC is the right metric under heavy imbalance (ml.md §6).
+    evaluator = BinaryClassificationEvaluator(
+        labelCol="label",
+        rawPredictionCol="rawPrediction",
+        metricName="areaUnderPR",
+    )
+    cv = CrossValidator(
+        estimator=estimator,
+        estimatorParamMaps=grid,
+        evaluator=evaluator,
+        numFolds=CV_FOLDS,
+        parallelism=2,
+        seed=SEED,
+        # Collect each fold's metric for the report's learning-curve plot.
+        collectSubModels=False,
+    )
+
+    # 5. Fit on the balanced train split.
+    print(f"[train_models] {args.model}: fitting CrossValidator on train...")
+    cv_model = cv.fit(train_balanced)
+    best = cv_model.bestModel
+    print(f"[train_models] {args.model}: best params = "
+          f"{ {p.name: best.getOrDefault(p) for p in best.params if best.isSet(p)} }")
+    print(f"[train_models] {args.model}: per-combo mean PR-AUC over folds:")
+    for params, metric in zip(grid, cv_model.avgMetrics):
+        compact = {k.name: v for k, v in params.items()}
+        print(f"    PR-AUC={metric:.6f}   {compact}")
+
+    # 6. Save best model. The CrossValidatorModel itself is not persisted —
+    #    only the best fitted estimator, which is what evaluate_models.py loads.
+    model_path = f"project/models/{model_dir}"
+    print(f"[train_models] {args.model}: saving best model -> {model_path}")
+    best.write().overwrite().save(model_path)
+
+    # 7. Predict on the held-out test split (original imbalance, NO weights).
+    print(f"[train_models] {args.model}: scoring test split")
+    predictions = best.transform(test)
+
+    # Test PR-AUC for the report (full evaluation happens in evaluate_models.py).
+    test_prauc = evaluator.evaluate(predictions)
+    print(f"[train_models] {args.model}: test PR-AUC = {test_prauc:.6f}")
+
+    # 8. Save predictions CSV — keep only (label, prediction) per course spec
+    #    "Keep only label and prediction columns. Save it as one partition."
+    pred_path = f"project/output/{model_dir}_predictions"
+    print(f"[train_models] {args.model}: saving predictions -> {pred_path}")
+    (predictions
+        .select(F.col("label"), F.col("prediction").cast("int").alias("prediction"))
+        .coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(pred_path))
+
+    spark.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
