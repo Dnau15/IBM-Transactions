@@ -47,7 +47,7 @@ def plot_q1(df: pd.DataFrame, name: str) -> None:
     ax.plot(df["day"], df["rate"] * 100, marker="o", color=LAUNDER_COLOR)
     ax.set_xlabel("Date")
     ax.set_ylabel("Laundering rate (%)")
-    ax.set_title("q1 — Daily laundering rate over the 28-day window")
+    ax.set_title("q1 — Daily laundering rate (Sept 1–16 active window)")
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
     _save(fig, name)
@@ -285,11 +285,26 @@ def plot_q10(df: pd.DataFrame, name: str) -> None:
     _save(fig, name)
 
 
+_Q11_BIN_LABELS = {
+    -1: "<$1",
+    0:  "$1–10",
+    1:  "$10–100",
+    2:  "$100–1K",
+    3:  "$1K–10K",
+    4:  "$10K–100K",
+    5:  "$100K–1M",
+    6:  "$1M–10M",
+    7:  "$10M–100M",
+    8:  "$100M–1B",
+    9:  "$1B+",
+}
+
+
 def plot_q11(df: pd.DataFrame, name: str) -> None:
-    """Amount distribution by class, normalized so each class's bars sum
+    """Amount distribution by class, normalised so each class's bars sum
     to 100%. Reveals where laundering over- or under-represents on the
-    amount-size axis (round-number 'structuring' peaks are the classic
-    AML signature near $9k / $99k)."""
+    amount-size axis (round-number 'structuring' peaks would show up
+    around the $1K–10K / $10K–100K bins in the laundering series)."""
     pivot = (df.pivot_table(index="log10_bin", columns="is_laundering",
                              values="n", aggfunc="sum", fill_value=0)
                 .rename(columns={0: "Legitimate", 1: "Laundering"})
@@ -297,18 +312,19 @@ def plot_q11(df: pd.DataFrame, name: str) -> None:
     legit = pivot["Legitimate"] / pivot["Legitimate"].sum() * 100
     laund = pivot["Laundering"] / pivot["Laundering"].sum() * 100
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    x = np.array(pivot.index)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = np.arange(len(pivot.index))
     width = 0.4
     ax.bar(x - width / 2, legit, width, color=LEGIT_COLOR, label="Legitimate")
     ax.bar(x + width / 2, laund, width, color=LAUNDER_COLOR, label="Laundering")
-    ax.set_xlabel("Amount paid — log10 decade  "
-                  "(bin N covers $10$^N$..$10$^{N+1})$")
+    ax.set_xlabel("amount_paid bucket (log10 decade)")
     ax.set_ylabel("Share of class (%)")
     ax.set_title("q11 — Transaction amount distribution by class "
                  "(per-class density)")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"$10^{{{int(b)}}}$" for b in x])
+    ax.set_xticklabels([_Q11_BIN_LABELS.get(int(b), str(int(b)))
+                        for b in pivot.index])
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
     _save(fig, name)
