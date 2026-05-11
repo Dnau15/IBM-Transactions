@@ -1,7 +1,6 @@
 -- q12: Laundering rate by hour-of-day × day-of-week.
--- Filtered to Sept 1-16 (the "active" legitimate-stream window) — without
--- this filter, the laundering-only tail of Sept 17-28 (see q1 discussion)
--- skews every hour bin into the 50-65% range.
+-- The transactions table is already filtered to the active window in
+-- db.hql (see ${hivevar:ACTIVE_UNTIL}); no per-query date filter needed.
 -- DAYOFWEEK returns 1=Sunday..7=Saturday in Hive 3.x; plot side reorders
 -- the rows so Monday appears first.
 USE team1_projectdb;
@@ -15,6 +14,5 @@ SELECT
     SUM(is_laundering)                                             AS laundering,
     ROUND(SUM(is_laundering) * 1.0 / COUNT(*), 6)                  AS rate
 FROM transactions
-WHERE txn_date <= '2022-09-16'
 GROUP BY HOUR(ts), DAYOFWEEK(ts)
 ORDER BY day_of_week, hour_of_day;

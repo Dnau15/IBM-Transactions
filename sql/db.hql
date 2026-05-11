@@ -13,6 +13,15 @@ SET hive.enforce.bucketing=true;
 -- (`hive.local.time.zone` is inert for BIGINT→TIMESTAMP casts in Hive 3.x —
 -- we handle the TZ shift explicitly in the INSERT below instead.)
 
+-- Active-window cutoff: the AMLworld simulator stops emitting the legitimate
+-- stream around Sept 16; Sept 17-28 contains only the trailing edge of
+-- laundering patterns, which makes per-day laundering rates jump from
+-- ~0.1% to ~60% (artefact, not behavior — see q1 discussion). We restrict
+-- the transactions table to the active window so downstream EDA and Stage III
+-- training don't have to remember to filter every time. laundering_patterns
+-- is left unfiltered so q6/q9/q14 still see the full pattern catalogue.
+SET hivevar:ACTIVE_UNTIL='2022-09-16';
+
 DROP DATABASE IF EXISTS team1_projectdb CASCADE;
 CREATE DATABASE team1_projectdb LOCATION 'project/hive/warehouse';
 USE team1_projectdb;
@@ -75,23 +84,27 @@ TBLPROPERTIES ('parquet.compression'='SNAPPY');
 -- Hive's CAST(BIGINT → TIMESTAMP) interprets the long in UTC and produces
 -- "Aug 31 21:00", which falls into the wrong DATE partition. Compensate by
 -- adding 3 hours (10,800,000 ms) before extracting the date.
+-- Outer WHERE applies the active-window cutoff from ${hivevar:ACTIVE_UNTIL}.
 INSERT OVERWRITE TABLE transactions PARTITION (txn_date)
-SELECT
-    txn_id,
-    CAST(`timestamp` + 10800000 AS TIMESTAMP)   AS ts,
-    from_bank,
-    from_account,
-    to_bank,
-    to_account,
-    CAST(amount_received AS DECIMAL(20,4))      AS amount_received,
-    receiving_currency,
-    CAST(amount_paid AS DECIMAL(20,4))          AS amount_paid,
-    payment_currency,
-    payment_format,
-    CAST(is_laundering AS INT)                  AS is_laundering,
-    DATE_ADD('1970-01-01',
-             CAST((`timestamp` + 10800000) DIV 86400000 AS INT)) AS txn_date
-FROM transactions_raw;
+SELECT * FROM (
+    SELECT
+        txn_id,
+        CAST(`timestamp` + 10800000 AS TIMESTAMP)   AS ts,
+        from_bank,
+        from_account,
+        to_bank,
+        to_account,
+        CAST(amount_received AS DECIMAL(20,4))      AS amount_received,
+        receiving_currency,
+        CAST(amount_paid AS DECIMAL(20,4))          AS amount_paid,
+        payment_currency,
+        payment_format,
+        CAST(is_laundering AS INT)                  AS is_laundering,
+        DATE_ADD('1970-01-01',
+                 CAST((`timestamp` + 10800000) DIV 86400000 AS INT)) AS txn_date
+    FROM transactions_raw
+) t
+WHERE txn_date <= ${hivevar:ACTIVE_UNTIL};
 
 -- ---------- Patterns table (managed Parquet, no partitioning) ----------
 -- Only ~22k rows; partitioning here would be overkill.
