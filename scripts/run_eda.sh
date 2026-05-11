@@ -36,6 +36,9 @@ declare -A HEADERS=(
     [q7]="from_bank,to_bank,n,laundering_n"
     [q8]="bank_id,name,in_transactions,out_transactions,laundering_ratio"
     [q9]="n_banks,n_patterns"
+    [q10]="bank_id,name,in_transactions,out_transactions,total_tx,laundering_ratio"
+    [q11]="is_laundering,log10_bin,n,bin_min,bin_max"
+    [q13]="is_laundering,currency_scope,n"
 )
 
 # Stage password into a tmpfile and pass via beeline `-w`. Avoids the
@@ -51,7 +54,9 @@ BEELINE_AUTH=(-u "$HS2_URL" -n team1 -w "$PWDFILE")
 mkdir -p output
 
 if (( $# == 0 )); then
-    files=( sql/q[1-9].hql )
+    # Sort numerically (q2 before q10) — plain glob expansion would
+    # interleave q10/q11 between q1 and q2.
+    mapfile -t files < <(ls sql/q[0-9]*.hql 2>/dev/null | sort -V)
 else
     files=()
     for q in "$@"; do
