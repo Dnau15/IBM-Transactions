@@ -1,15 +1,24 @@
 -- b4: Pattern visibility per data-sharing setup. For each pattern_group:
---   isolated_visible_edges     edges seen by the SINGLE bank that holds
+--   isolated_visible_edges     edges seen by the single bank that holds
 --                              the largest share of this pattern's legs
 --   loose_consortium_edges     edges with >=1 endpoint in the top-20
 --                              banks by total volume
 --   strict_consortium_edges    edges with BOTH endpoints in the top-20
 -- The plot rolls these per-instance counts up to the 8 canonical types
 -- and reports the average fraction of edges visible to each setup.
+--
+-- Performance note: an earlier single-DAG version chained six CTEs
+-- (bank_volume -> top_banks + edges_at_bank -> isolated_per_pattern +
+-- consortium_per_pattern + pattern_size + final SELECT). The Tez AM
+-- repeatedly died planning that DAG. The rewrite breaks the work into
+-- two separate CREATE TABLE statements so Tez plans each in its own
+-- DAG, and b4_top_banks (20 rows) is materialised once so the main
+-- query never re-runs the heavy bank-volume aggregation.
 USE team1_projectdb;
+DROP TABLE IF EXISTS b4_top_banks;
 DROP TABLE IF EXISTS b4_results;
 
-CREATE TABLE b4_results AS
+CREATE TABLE b4_top_banks AS
 WITH bank_volume AS (
     SELECT bank, SUM(n) AS total_n
     FROM (
@@ -18,11 +27,14 @@ WITH bank_volume AS (
         SELECT to_bank   AS bank, COUNT(*) AS n FROM transactions GROUP BY to_bank
     ) u
     GROUP BY bank
-),
-top_banks AS (
-    SELECT bank FROM bank_volume ORDER BY total_n DESC LIMIT 20
-),
-edges_at_bank AS (
+)
+SELECT bank
+FROM bank_volume
+ORDER BY total_n DESC
+LIMIT 20;
+
+CREATE TABLE b4_results AS
+WITH edges_at_bank AS (
     -- Edge count of each pattern visible to each bank touching it.
     -- For an intra-bank edge (from = to), the bank still sees it
     -- exactly once: the second UNION arm's WHERE clause skips the
@@ -49,8 +61,8 @@ consortium_per_pattern AS (
         SUM(CASE WHEN tbf.bank IS NOT NULL OR  tbt.bank IS NOT NULL THEN 1 ELSE 0 END) AS loose_consortium_edges,
         SUM(CASE WHEN tbf.bank IS NOT NULL AND tbt.bank IS NOT NULL THEN 1 ELSE 0 END) AS strict_consortium_edges
     FROM laundering_patterns lp
-    LEFT JOIN top_banks tbf ON lp.from_bank = tbf.bank
-    LEFT JOIN top_banks tbt ON lp.to_bank   = tbt.bank
+    LEFT JOIN b4_top_banks tbf ON lp.from_bank = tbf.bank
+    LEFT JOIN b4_top_banks tbt ON lp.to_bank   = tbt.bank
     GROUP BY lp.pattern_group
 ),
 pattern_size AS (
