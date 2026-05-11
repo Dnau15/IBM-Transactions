@@ -23,15 +23,16 @@ top_banks AS (
     SELECT bank FROM bank_volume ORDER BY total_n DESC LIMIT 20
 ),
 edges_at_bank AS (
-    -- Distinct edges of each pattern visible to each bank touching it.
-    -- For an intra-bank edge (from = to), the bank still sees it exactly
-    -- once — we deduplicate via the WHERE on the second UNION arm.
+    -- Edge count of each pattern visible to each bank touching it.
+    -- For an intra-bank edge (from = to), the bank still sees it
+    -- exactly once: the second UNION arm's WHERE clause skips the
+    -- to-side row when both endpoints are the same bank.
     SELECT pattern_group, bank, COUNT(*) AS n_visible
     FROM (
-        SELECT pattern_group, txn_id, from_bank AS bank
+        SELECT pattern_group, from_bank AS bank
         FROM laundering_patterns
         UNION ALL
-        SELECT pattern_group, txn_id, to_bank AS bank
+        SELECT pattern_group, to_bank AS bank
         FROM laundering_patterns
         WHERE from_bank <> to_bank
     ) u
