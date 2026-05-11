@@ -37,10 +37,30 @@ declare -A HEADERS=(
     [q8]="bank_id,name,in_transactions,out_transactions,laundering_ratio"
     [q9]="n_banks,n_patterns"
     [q10]="bank_id,name,in_transactions,out_transactions,total_tx,laundering_ratio"
-    [q11]="is_laundering,log10_bin,n,bin_min,bin_max"
+    [q11]="payment_currency,is_laundering,log10_bin,n,bin_min,bin_max"
     [q12]="hour_of_day,day_of_week,total,laundering,rate"
     [q13]="is_laundering,currency_scope,n"
     [q14]="pattern_group,pattern_type,duration_seconds,duration_hours,duration_days"
+    # Stage-II data-understanding additions (q15..q20). q16 has no Hive
+    # entry because it is rendered through scripts/q16_components.py
+    # (GraphFrames). Run that script separately:
+    #   spark-submit --packages graphframes:graphframes:0.8.2-spark3.2-s_2.12 \
+    #       --py-files scripts/spark_session.py scripts/q16_components.py
+    [q7b]="from_rank,to_rank,n,laundering_n"
+    [q15]="direction,ever_laundering,deg,n_accounts"
+    [q17]="is_laundering,decade,n"
+    [q18]="pattern_type,n_banks,n_patterns"
+    [q19]="payment_currency,receiving_currency,is_laundering,n,total_amount"
+    [q20]="from_bank,to_bank,n_total,n_laundering,laundering_rate"
+    # Business-understanding additions (b1, b4, b5, b6, b14, b15, b16).
+    # Same beeline pipeline as the q* queries; only the prefix changes.
+    [b1]="is_laundering,bin_lo,n"
+    [b4]="pattern_group,pattern_type,n_edges_total,isolated_visible_edges,loose_consortium_edges,strict_consortium_edges"
+    [b5]="coverage_type,is_laundering,k,n_at_k"
+    [b6]="pattern_type,n_patterns,n_with_inter_edge,total_intra_edges,total_inter_edges"
+    [b14]="pattern_type,n_transactions,n_pattern_instances,total_usd"
+    [b15]="ever_laundering,lifetime_bucket,n_accounts"
+    [b16]="hour_of_day,is_laundering,n"
 )
 
 # Stage password into a tmpfile and pass via beeline `-w`. Avoids the
@@ -57,8 +77,9 @@ mkdir -p output
 
 if (( $# == 0 )); then
     # Sort numerically (q2 before q10) — plain glob expansion would
-    # interleave q10/q11 between q1 and q2.
-    mapfile -t files < <(ls sql/q[0-9]*.hql 2>/dev/null | sort -V)
+    # interleave q10/q11 between q1 and q2. We pick up business queries
+    # (b1..b9) alongside the EDA q* queries; either prefix is valid.
+    mapfile -t files < <(ls sql/q[0-9]*.hql sql/b[0-9]*.hql 2>/dev/null | sort -V)
 else
     files=()
     for q in "$@"; do
