@@ -38,7 +38,9 @@ declare -A HEADERS=(
     [q9]="n_banks,n_patterns"
     [q10]="bank_id,name,in_transactions,out_transactions,total_tx,laundering_ratio"
     [q11]="is_laundering,log10_bin,n,bin_min,bin_max"
+    [q12]="hour_of_day,day_of_week,total,laundering,rate"
     [q13]="is_laundering,currency_scope,n"
+    [q14]="pattern_group,pattern_type,duration_seconds,duration_hours,duration_days"
 )
 
 # Stage password into a tmpfile and pass via beeline `-w`. Avoids the

@@ -314,6 +314,27 @@ def plot_q11(df: pd.DataFrame, name: str) -> None:
     _save(fig, name)
 
 
+def plot_q12(df: pd.DataFrame, name: str) -> None:
+    """Hour-of-day × day-of-week heatmap of laundering rate. Hive
+    DAYOFWEEK returns 1=Sun..7=Sat — we reorder to Mon..Sun."""
+    pivot = df.pivot_table(index="day_of_week", columns="hour_of_day",
+                           values="rate", fill_value=0)
+    pivot = pivot.reindex([2, 3, 4, 5, 6, 7, 1])  # Mon..Sun
+
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    im = ax.imshow(pivot.values * 100, cmap="magma", aspect="auto")
+    ax.set_yticks(range(7))
+    ax.set_yticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    ax.set_xticks(range(24))
+    ax.set_xticklabels(range(24))
+    ax.set_xlabel("Hour of day (cluster local TZ, MSK)")
+    ax.set_ylabel("Day of week")
+    ax.set_title("q12 — Laundering rate by hour × weekday "
+                 "(Sept 1-16, active stream only)")
+    fig.colorbar(im, ax=ax, label="Laundering rate (%)")
+    _save(fig, name)
+
+
 def plot_q13(df: pd.DataFrame, name: str) -> None:
     """Currency mismatch (cross-currency transactions) share by class.
     Same plot shape as q4; expected to show 'mismatch' over-represented
@@ -336,6 +357,36 @@ def plot_q13(df: pd.DataFrame, name: str) -> None:
     _save(fig, name)
 
 
+def plot_q14(df: pd.DataFrame, name: str) -> None:
+    """Pattern duration distribution by canonical type. Box-and-whisker
+    per type, y-axis on log scale (durations span seconds to days)."""
+    df = df.copy()
+    df["canonical"] = df["pattern_type"].map(_canonicalize_pattern)
+    # Use hours; clip 0 -> 0.01 so log scale doesn't blow up on
+    # single-transaction patterns (duration == 0).
+    df["duration_hours_clipped"] = df["duration_hours"].clip(lower=0.01)
+
+    order = [c for c in CANONICAL_PATTERNS
+             if (df["canonical"] == c).any()]
+    data_by_type = [df.loc[df["canonical"] == c,
+                            "duration_hours_clipped"].values
+                    for c in order]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.boxplot(data_by_type, labels=order, showfliers=True,
+               patch_artist=True,
+               boxprops=dict(facecolor=LAUNDER_COLOR, alpha=0.5),
+               medianprops=dict(color="black"))
+    ax.set_yscale("log")
+    ax.set_ylabel("Pattern duration (hours, log scale)")
+    ax.set_xlabel("Canonical pattern type")
+    ax.set_title("q14 — Pattern duration distribution per canonical type "
+                 "(N={:,} pattern instances)".format(len(df)))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    ax.grid(True, axis="y", alpha=0.3, which="both")
+    _save(fig, name)
+
+
 PLOTS = {
     "q1": plot_q1,
     "q2": plot_q2,
@@ -348,7 +399,9 @@ PLOTS = {
     "q9": plot_q9,
     "q10": plot_q10,
     "q11": plot_q11,
+    "q12": plot_q12,
     "q13": plot_q13,
+    "q14": plot_q14,
 }
 
 
