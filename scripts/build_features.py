@@ -443,11 +443,15 @@ def build_features(spark):
             "DEV MODE: SAMPLE_FRACTION=%.4f — random row sample (seed=%d)",
             frac, DEV_MODE_SEED,
         )
-        txn = txn.sample(
-            withReplacement=False,
-            fraction=frac,
-            seed=DEV_MODE_SEED,
-        )
+        # NOTE: we deliberately use a `where(rand() < frac)` filter rather
+        # than Dataset.sample(). The transactions table is CLUSTERED BY
+        # (from_bank) INTO 16 BUCKETS, and Spark's optimizer can push
+        # Dataset.sample() down into bucket-selection on bucketed Hive
+        # sources — interpreting "0.01 of 16 buckets" as zero buckets and
+        # silently producing an empty result. A row-level `where` is not
+        # eligible for that pushdown, so the Bernoulli sample is honoured
+        # per-row regardless of the source's bucket spec.
+        txn = txn.where(F.rand(seed=DEV_MODE_SEED) < F.lit(frac))
 
     log.info("adding per-row features (%d cols)", len(ROW_NUMERIC))
     df = compute_row_features(txn)
@@ -541,6 +545,22 @@ def main():
                  len(df_lazy.columns), len(NUMERIC_FEATURES), len(CATEGORICAL_FEATURES))
         log.info("input partitions = %d", df_lazy.rdd.getNumPartitions())
 
+        # Force the entire lazy DAG to execute and count its output rows.
+        # This is the decisive diagnostic if step 2 produces 0 rows: if
+        # pre_materialize is non-zero but materialized is zero, the bug is
+        # in the write/re-read path (location mismatch, metastore stale
+        # cache); if pre_materialize is also zero, the bug is upstream
+        # (LIMIT_DAYS filter, windowing, or compute_row_features).
+        pre_materialize_rows = df_lazy.count()
+        log.info("pre-materialize row count = %s", f"{pre_materialize_rows:,}")
+        if pre_materialize_rows == 0:
+            raise RuntimeError(
+                "lazy feature DAG produced 0 rows BEFORE write — bug is "
+                "upstream of saveAsTable (likely the LIMIT_DAYS filter or "
+                "a window/compute transform). Inspect the filter predicate "
+                "against the txn_date column type."
+            )
+
     # -------------------------------------------------------------------------
     # 2. Materialize features to Parquet + register Hive table. This forces
     #    the entire window-function DAG to run ONCE; every subsequent step
@@ -550,13 +570,57 @@ def main():
     with step(f"materialize features -> {HDFS_FEATURES_PARQUET} + hive {FEATURES_TABLE}"):
         log.info("dropping previous Hive table (if any)")
         spark.sql(f"DROP TABLE IF EXISTS {FEATURES_TABLE}")
-        log.info("running saveAsTable — this triggers the windowed DAG")
+
+        # Split the previous saveAsTable into TWO explicit steps:
+        #   (a) write Parquet to a known HDFS path via .parquet()
+        #   (b) register an EXTERNAL TABLE pointing at that exact path
+        # The combined .option("path", relative) + .saveAsTable() form has
+        # been observed to produce a Hive metastore entry whose LOCATION
+        # doesn't match where the Parquet files actually landed — leading
+        # to saveAsTable claiming success while spark.table(...) sees an
+        # empty directory. Splitting eliminates that ambiguity: the write
+        # uses an explicit absolute path and the CREATE EXTERNAL TABLE
+        # uses the same path verbatim.
+        write_path = HDFS_FEATURES_PARQUET
+        log.info("writing parquet directly to %s", write_path)
         (df_lazy.write
             .mode("overwrite")
             .option("compression", "snappy")
-            .option("path", HDFS_FEATURES_PARQUET)
-            .format("parquet")
-            .saveAsTable(FEATURES_TABLE))
+            .parquet(write_path))
+        # Probe the directory we just wrote to AND extract the absolute
+        # HDFS URI Spark actually used. This is essential: relative paths
+        # resolve DIFFERENTLY between Spark's DataFrameWriter and Hive's
+        # CREATE EXTERNAL TABLE — the writer uses the FS default root
+        # (/user/team1/), Hive uses spark.sql.warehouse.dir as the base
+        # (/user/team1/project/hive/warehouse/). Passing the same
+        # relative string to both yields TWO different physical paths,
+        # which is what was producing empty `features` tables on every
+        # run (data on disk at one path, metastore pointing at another).
+        #
+        # The fix is to capture the absolute URI that .parquet() resolved
+        # to and use it verbatim in CREATE EXTERNAL TABLE.
+        absolute_location = write_path  # fallback if probe fails
+        try:
+            jvm = spark._jvm
+            jsc = spark._jsc
+            hadoop_path = jvm.org.apache.hadoop.fs.Path(write_path)
+            fs = hadoop_path.getFileSystem(jsc.hadoopConfiguration())
+            absolute_location = fs.resolvePath(hadoop_path).toString()
+            statuses = fs.listStatus(hadoop_path)
+            n_files = len([s for s in statuses if not s.isDirectory()])
+            total_bytes = sum(s.getLen() for s in statuses)
+            log.info(
+                "post-write probe: %d files, %.1f MiB at %s",
+                n_files, total_bytes / (1024 * 1024), absolute_location,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning("post-write probe failed (non-fatal): %s", exc)
+
+        log.info("registering external Hive table at %s", absolute_location)
+        spark.sql(
+            f"CREATE EXTERNAL TABLE {FEATURES_TABLE} "
+            f"USING parquet LOCATION '{absolute_location}'"
+        )
         log.info("write complete; re-reading from disk for downstream steps")
         # Re-read so subsequent operations hit Parquet, not the window DAG.
         df = spark.table(FEATURES_TABLE)

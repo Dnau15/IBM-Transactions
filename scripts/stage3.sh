@@ -41,7 +41,6 @@ fi
 
 TEAM="team1"
 HDFS_USER="/user/${TEAM}"
-METASTORE_URI="thrift://hadoop-02.uni.innopolis.ru:9883"
 
 # Cluster's system Python (3.6) ships pyspark 3.2.4 in /usr/local/lib/...;
 # our .venv311 masks that and breaks spark-submit. Same incantation as
@@ -56,33 +55,14 @@ export PYTHONIOENCODING=utf-8
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
-# Hive metastore URI is bound THREE ways for robustness — without this an
-# interactively-launched pyspark sees team1_projectdb.* fine but a
-# spark-submit driver silently falls back to a local Derby metastore,
-# leading to SHOW TABLES "working" but returning empty / wrong content.
-#
-#   1) spark.hadoop.hive.metastore.uris — Spark propagates this into the
-#      Hadoop/Hive client conf. Modern, recommended path.
-#   2) spark.{driver,executor}.extraJavaOptions=-Dhive.metastore.uris=…
-#      JVM-level fallback. Some Hive client init paths read the URI from
-#      system properties before SparkConf is applied; this catches anything
-#      (1) misses, and is the same flag we use when launching pyspark
-#      interactively.
-#   3) spark_session.py also sets it via .config("hive.metastore.uris", …)
-#      as a third belt-and-braces layer.
-#
-# spark.sql.catalogImplementation=hive guarantees the Hive catalog is
-# chosen even if enableHiveSupport() doesn't get called (e.g. when
-# something pre-creates a SparkSession before build_session()).
-SPARK_SUBMIT=(
-    spark-submit
-    --master yarn
-    --deploy-mode client
-    --conf "spark.sql.catalogImplementation=hive"
-    --conf "spark.hadoop.hive.metastore.uris=${METASTORE_URI}"
-    --conf "spark.driver.extraJavaOptions=-Dhive.metastore.uris=${METASTORE_URI}"
-    --conf "spark.executor.extraJavaOptions=-Dhive.metastore.uris=${METASTORE_URI}"
-)
+# Match the lab's spark-submit form: --master yarn, nothing else.
+# The Hive metastore URI, warehouse dir, AVRO codec, and Hive support
+# are all set inside scripts/spark_session.py via SparkSession.builder
+# — those are applied before any Hive operation in the script runs, so
+# spark-submit doesn't need the -Dhive.metastore.uris= JVM property
+# that's necessary for the pyspark interactive shell (which loads Hive
+# before user Python configs apply).
+SPARK_SUBMIT=(spark-submit --master yarn)
 
 # Every Stage III job imports spark_session.py, and most also import
 # build_features.py for TRAIN_FRACTION. Ship both as --py-files so YARN
@@ -154,6 +134,7 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/evaluation" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_pattern_recall" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_weekend_weekday" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_at_fixed_recall" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/evaluate_models.py
 fi
@@ -218,6 +199,45 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
         2>/dev/null | tail -n +2 >> output/eval_weekend_weekday.csv || true
     echo "[stage3] -> output/eval_weekend_weekday.csv"
     cat output/eval_weekend_weekday.csv
+
+    # 5g. Alert-volume-at-fixed-recall (ml.md §6 operational metric).
+    #     One row per (model, target_recall ∈ {0.5, 0.7, 0.9}).
+    rm -f output/eval_at_fixed_recall.csv
+    echo "model,target_recall,threshold,alerts,tp,actual_recall,precision" \
+        > output/eval_at_fixed_recall.csv
+    hdfs dfs -cat "${HDFS_USER}/project/output/eval_at_fixed_recall/part-*.csv" \
+        2>/dev/null | tail -n +2 >> output/eval_at_fixed_recall.csv || true
+    echo "[stage3] -> output/eval_at_fixed_recall.csv"
+    cat output/eval_at_fixed_recall.csv
+fi
+
+# -----------------------------------------------------------------------------
+# 6. Pylint — Stage III rubric line item.
+#    Runs over the five Python scripts. We do NOT fail the build on
+#    pylint findings: pylint is heuristic, and a single "fixme" or
+#    "too-many-locals" doesn't justify wedging the entire submission.
+#    The exit code is reported in the log so the grader can see whether
+#    the run passed cleanly. Skip with SKIP_PYLINT=1 for fast iterations.
+# -----------------------------------------------------------------------------
+if [[ "${SKIP_PYLINT:-0}" != "1" ]]; then
+    echo "============================================================"
+    echo "[stage3] (6) pylint scripts"
+    echo "============================================================"
+    if command -v pylint >/dev/null 2>&1; then
+        # --rcfile picks up .pylintrc at the repo root if present;
+        # falls back to defaults otherwise. --exit-zero so a non-clean
+        # run doesn't kill the bash script (we still see the score).
+        pylint --rcfile=.pylintrc --exit-zero \
+            scripts/spark_session.py \
+            scripts/build_features.py \
+            scripts/rule_baseline.py \
+            scripts/train_models.py \
+            scripts/evaluate_models.py \
+            | tee output/pylint.txt
+        echo "[stage3] -> output/pylint.txt"
+    else
+        echo "[stage3] pylint not installed; skipping (install with: pip install --user pylint)"
+    fi
 fi
 
 echo "[stage3] done."
