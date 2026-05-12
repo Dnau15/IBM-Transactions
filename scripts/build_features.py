@@ -168,8 +168,11 @@ OUT_24H_NUMERIC = [
     "out_mean_24h",
     "out_std_24h",
     "out_max_24h",
+    "out_min_24h",
     "out_unique_dst_24h",
     "out_unique_banks_24h",
+    "out_unique_currencies_24h",
+    "out_unique_formats_24h",
 ]
 
 # Past-24h window features keyed on to_account (incoming side).
@@ -177,6 +180,7 @@ IN_24H_NUMERIC = [
     "in_count_24h",
     "in_sum_24h",
     "in_mean_24h",
+    "in_std_24h",
     "in_unique_src_24h",
     "in_unique_banks_24h",
 ]
@@ -316,9 +320,16 @@ def add_outgoing_windows(df):
         # stddev_samp returns NULL on a single-row window; coalesce to 0.
         .withColumn("out_std_24h", F.coalesce(F.stddev_samp("amount_paid").over(w24), F.lit(0.0)))
         .withColumn("out_max_24h", F.max("amount_paid").over(w24))
+        .withColumn("out_min_24h", F.min("amount_paid").over(w24))
         # collect_set is windowable; size() converts to cardinality.
         .withColumn("out_unique_dst_24h", F.size(F.collect_set("to_account").over(w24)))
         .withColumn("out_unique_banks_24h", F.size(F.collect_set("to_bank").over(w24)))
+        # Diversity signals — laundering patterns often touch multiple
+        # currencies / payment formats within a short window.
+        .withColumn("out_unique_currencies_24h",
+                    F.size(F.collect_set("payment_currency").over(w24)))
+        .withColumn("out_unique_formats_24h",
+                    F.size(F.collect_set("payment_format").over(w24)))
         # 1h velocity
         .withColumn("out_count_1h", F.count(F.lit(1)).over(w1))
         .withColumn("out_sum_1h", F.sum("amount_paid").over(w1))
@@ -338,6 +349,9 @@ def add_incoming_windows(df):
         .withColumn("in_count_24h", F.count(F.lit(1)).over(w24))
         .withColumn("in_sum_24h", F.sum("amount_received").over(w24))
         .withColumn("in_mean_24h", F.avg("amount_received").over(w24))
+        # stddev_samp returns NULL on a single-row window; coalesce to 0.
+        .withColumn("in_std_24h",
+                    F.coalesce(F.stddev_samp("amount_received").over(w24), F.lit(0.0)))
         .withColumn("in_unique_src_24h", F.size(F.collect_set("from_account").over(w24)))
         .withColumn("in_unique_banks_24h", F.size(F.collect_set("from_bank").over(w24)))
     )
