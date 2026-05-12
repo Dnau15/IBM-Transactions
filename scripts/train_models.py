@@ -5,7 +5,7 @@ Each model is:
     * fit on the training split with class-weighted loss + negative
       downsampling on the training set ONLY (val/test untouched);
     * hyperparameter-optimized via ParamGridBuilder + CrossValidator
-      (k=3 folds, 2 model hyperparameters per the course rubric);
+      (k=3 folds, 3 model hyperparameters per the Final Project rubric);
     * persisted to project/models/modelN on HDFS;
     * scored on the held-out test split → predictions CSV at
       project/output/modelN_predictions/.
@@ -113,11 +113,13 @@ def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEE
 def build_logreg():
     """model1 — LogisticRegression (classical).
 
-    Per the Stage III rubric we tune exactly two *model* hyperparameters
-    (i.e. parameters that change the hypothesis class, not training
+    Per the Final Project rubric we tune three *model* hyperparameters
+    (i.e.\\ parameters that change the hypothesis class, not training
     controls like `maxIter` or `aggregationDepth`):
         regParam        — L2 strength (regularization weight)
         elasticNetParam — L1/L2 mix (0 = pure L2, 1 = pure L1)
+        fitIntercept    — whether the hypothesis class includes a bias
+                          term (structural; not a training knob)
     """
     lr = LogisticRegression(
         labelCol="label",
@@ -131,6 +133,7 @@ def build_logreg():
         ParamGridBuilder()
         .addGrid(lr.regParam, [0.001, 0.01, 0.1])
         .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+        .addGrid(lr.fitIntercept, [True, False])
         .build()
     )
     return lr, grid
@@ -139,13 +142,20 @@ def build_logreg():
 def build_gbt():
     """model2 — GBTClassifier (non-classical / boosting).
 
-    Per the Stage III rubric we tune two *model* hyperparameters that are
-    structural properties of the learner, not training controls like
-    `maxIter` or `stepSize` (learning-rate-style knobs):
-        maxDepth         — depth of each weak learner (model capacity)
-        subsamplingRate  — fraction of training rows each tree sees
-                           (row-level bagging — a structural property of
-                           the ensemble, not a stopping criterion)
+    Per the Final Project rubric we tune three *model* hyperparameters
+    that are structural properties of the learner, not training controls
+    like `maxIter` or `stepSize` (learning-rate-style knobs):
+        maxDepth              — depth of each weak learner (model capacity)
+        subsamplingRate       — fraction of training rows each tree sees
+                                (row-level bagging — a structural
+                                property of the ensemble, not a stopping
+                                criterion)
+        featureSubsetStrategy — number of features considered at each
+                                split: "all" gives the canonical
+                                gradient-boosting behavior, "sqrt"
+                                mixes in random-forest-style column
+                                bagging (structural complement to
+                                row-level subsampling)
     """
     gbt = GBTClassifier(
         labelCol="label",
@@ -158,6 +168,7 @@ def build_gbt():
         ParamGridBuilder()
         .addGrid(gbt.maxDepth, [3, 5, 7])
         .addGrid(gbt.subsamplingRate, [0.7, 1.0])
+        .addGrid(gbt.featureSubsetStrategy, ["all", "sqrt"])
         .build()
     )
     return gbt, grid
