@@ -1,0 +1,62 @@
+[MAIN]
+# Don't lint vendored deps, notebooks, or generated files.
+ignore-paths=
+    ^.venv311/.*,
+    ^notebooks/.*,
+    ^report/.*
+
+# Treat the repo root as a top-level package; allows pylint to resolve
+# cross-script imports (e.g. `from spark_session import build_session`).
+init-hook='import sys; sys.path.insert(0, "scripts")'
+
+# pylint can't introspect pyspark's Java-backed columns/functions; declaring
+# the package as an extension stops the no-member cascade.
+extension-pkg-allow-list=pyspark
+
+[MESSAGES CONTROL]
+# Disabled categories, with the reason each one is suppressed.
+disable=
+    # --- PySpark false positives -------------------------------------------
+    # F.col / F.lit / Column.* are dynamically attached; pylint can't see them.
+    no-member,
+    # pyspark internal modules (pyspark.ml.functions, pyspark.storagelevel, …)
+    # often don't resolve under static analysis on a non-cluster machine.
+    no-name-in-module,
+    import-error,
+    # PySpark uses camelCase for method/parameter names (saveAsTable, withColumn).
+    invalid-name,
+
+    # --- Style choices we accept in research/glue scripts ------------------
+    # Some module-level helpers don't need a one-liner docstring.
+    missing-function-docstring,
+    missing-class-docstring,
+    # Spark transformation chains are inherently long; we keep lines readable
+    # by chunking the `.withColumn(...)` calls vertically and accept the width.
+    line-too-long,
+    # main() in each Stage III script is long by design (it's an ETL flow).
+    too-many-locals,
+    too-many-statements,
+    too-many-branches,
+    too-many-arguments,
+    too-many-instance-attributes,
+    too-many-positional-arguments,
+    # Stage III train_models.py LR/GBT branches share boilerplate by intent.
+    duplicate-code,
+    # Logging idioms — f-strings in log calls cost a few µs each; acceptable
+    # at this scale and far more readable than %-style formatting.
+    logging-fstring-interpolation,
+    logging-format-interpolation,
+    # We intentionally leave TODO/FIXME notes during iteration.
+    fixme
+
+[FORMAT]
+# We chunk Spark chains vertically, but absolute-cap at 120 — matches Black.
+max-line-length=120
+
+[BASIC]
+# Short names that are conventional in this codebase / in Spark code.
+good-names=
+    i,j,k,n,m,t,t0,r,g,b,v,x,y,
+    df,F,_,
+    cv,lr,
+    fp,fn,tp,tn

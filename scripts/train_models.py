@@ -30,8 +30,10 @@ import sys
 
 from pyspark.ml.classification import GBTClassifier, LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.functions import vector_to_array
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import functions as F
+from pyspark.storagelevel import StorageLevel
 
 from spark_session import build_session
 
@@ -178,8 +180,19 @@ def main():
     train = spark.read.parquet(HDFS_TRAIN)
     test = spark.read.parquet(HDFS_TEST)
 
-    # 2. Downsample negatives + attach class weights on train only.
-    train_balanced = downsample_and_weight(train)
+    # 2. Downsample negatives + attach class weights on train only, then
+    #    repartition to 2× executor cores (= 6 → bumped to 18 for inner
+    #    parallelism headroom under CV's parallelism=3) and cache. CV does
+    #    n_combos × numFolds passes over this set — caching once amortises
+    #    the downsample + orderBy(rand) shuffle across all of them.
+    train_balanced = (
+        downsample_and_weight(train)
+        .repartition(18)
+        .persist(StorageLevel.MEMORY_AND_DISK)
+    )
+    n_balanced = train_balanced.count()  # materialise the cache
+    print(f"[train_models] balanced train cached: {n_balanced:,} rows / "
+          f"{train_balanced.rdd.getNumPartitions()} partitions")
 
     # 3. Build estimator + hyperparameter grid.
     estimator, grid = builder()
@@ -189,6 +202,13 @@ def main():
 
     # 4. CrossValidator — optimizes PR-AUC on the train fold, not ROC-AUC.
     #    PR-AUC is the right metric under heavy imbalance (ml.md §6).
+    #    parallelism=4 lets four candidate models fit concurrently against
+    #    the 9-core executor pool (~2.25 cores per fit on average). This is
+    #    mild over-subscription vs parallelism=3 and improves wall-clock
+    #    throughput when individual fits are core-bound for short stretches.
+    #    Pushing further (parallelism=6+) starts to compete for the same
+    #    cores and hurts more than it helps. YARN allocation is unchanged —
+    #    only the driver-side ThreadPoolExecutor that submits parallel jobs.
     evaluator = BinaryClassificationEvaluator(
         labelCol="label",
         rawPredictionCol="rawPrediction",
@@ -199,9 +219,8 @@ def main():
         estimatorParamMaps=grid,
         evaluator=evaluator,
         numFolds=CV_FOLDS,
-        parallelism=2,
+        parallelism=4,
         seed=SEED,
-        # Collect each fold's metric for the report's learning-curve plot.
         collectSubModels=False,
     )
 
@@ -216,6 +235,9 @@ def main():
         compact = {k.name: v for k, v in params.items()}
         print(f"    PR-AUC={metric:.6f}   {compact}")
 
+    # Release the cached train set — the rest of main only touches test.
+    train_balanced.unpersist()
+
     # 6. Save best model. The CrossValidatorModel itself is not persisted —
     #    only the best fitted estimator, which is what evaluate_models.py loads.
     model_path = f"project/models/{model_dir}"
@@ -223,8 +245,15 @@ def main():
     best.write().overwrite().save(model_path)
 
     # 7. Predict on the held-out test split (original imbalance, NO weights).
+    #    Project to only the columns we need (label, prediction, probability,
+    #    rawPrediction) and cache — we will do three actions on this DF:
+    #    PR-AUC eval, predictions CSV write, probabilities CSV write.
     print(f"[train_models] {args.model}: scoring test split")
-    predictions = best.transform(test)
+    predictions = (
+        best.transform(test)
+        .select("label", "prediction", "probability", "rawPrediction")
+        .persist(StorageLevel.MEMORY_AND_DISK)
+    )
 
     # Test PR-AUC for the report (full evaluation happens in evaluate_models.py).
     test_prauc = evaluator.evaluate(predictions)
@@ -241,6 +270,29 @@ def main():
         .option("header", "true")
         .csv(pred_path))
 
+    # 9. Save probabilities CSV — (label, prediction, proba_positive) for
+    #    threshold-sweep analysis in evaluate_models.py. Kept in a separate
+    #    output path so the rubric-mandated _predictions table stays
+    #    schema-pure (label, prediction only).
+    #
+    #    `probability` is a length-2 Vector for binary classification —
+    #    [P(class 0), P(class 1)] — so index 1 is the positive class
+    #    probability. vector_to_array is a Catalyst-native expression
+    #    (Spark 3.0+), faster than a Python UDF.
+    prob_path = f"project/output/{model_dir}_probabilities"
+    print(f"[train_models] {args.model}: saving probabilities -> {prob_path}")
+    (predictions
+        .select(
+            F.col("label"),
+            F.col("prediction").cast("int").alias("prediction"),
+            vector_to_array("probability")[1].alias("proba_positive"),
+        )
+        .coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(prob_path))
+
+    predictions.unpersist()
     spark.stop()
 
 

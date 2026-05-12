@@ -33,13 +33,22 @@ from spark_session import HIVE_DB, build_session
 HDFS_TEST = "project/data/test_parquet"
 HDFS_EVAL = "project/output/evaluation"
 HDFS_RULE_OUT = "project/output/rule_baseline"
+# Threshold-sweep table: many rows per ML model, one per probability cutoff.
+HDFS_SWEEP = "project/output/eval_threshold_sweep"
 
 EVALUATION_TABLE = f"{HIVE_DB}.evaluation"
+SWEEP_TABLE = f"{HIVE_DB}.eval_threshold_sweep"
 
 MODELS = [
-    ("model1_LogisticRegression", "project/models/model1", LogisticRegressionModel),
-    ("model2_GBTClassifier",      "project/models/model2", GBTClassificationModel),
+    ("model1_LogisticRegression", "project/models/model1", LogisticRegressionModel, "model1"),
+    ("model2_GBTClassifier",      "project/models/model2", GBTClassificationModel,  "model2"),
 ]
+
+# Probability cutoffs swept in evaluation. Default-threshold 0.5 is included
+# so the sweep table aligns with the evaluation.csv operating point. Upper
+# end (0.95) is where the high-precision, low-volume regime lives at this
+# prevalence — useful for the "alert budget" discussion in the report.
+SWEEP_THRESHOLDS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 
 
 def confusion(df, pred_col="prediction", label_col="label"):
@@ -77,6 +86,47 @@ def score_model(spark, name, model_path, model_cls, test):
     return precision, recall, f1, pr_auc, alerts
 
 
+def threshold_sweep(probabilities, thresholds, model_name):
+    """Compute (precision, recall, f1, alerts) for many thresholds in a single scan.
+
+    Reads from a (label, prediction, proba_positive) DataFrame written by
+    train_models.py. For each threshold we sum tp/fp via boolean masks
+    on `proba_positive`; total_pos = #positives is shared across thresholds.
+    Returns a list of (model_name, threshold, precision, recall, f1, alerts).
+    """
+    # Build one aggregate per threshold + one global positive count.
+    # `int(thr*100)` keys avoid float-in-column-name issues.
+    agg_cols = []
+    for thr in thresholds:
+        key = int(thr * 100)
+        agg_cols.append(
+            F.sum(((F.col("proba_positive") >= thr) & (F.col("label") == 1)).cast("long"))
+             .alias(f"tp_{key}")
+        )
+        agg_cols.append(
+            F.sum(((F.col("proba_positive") >= thr) & (F.col("label") == 0)).cast("long"))
+             .alias(f"fp_{key}")
+        )
+    agg_cols.append(
+        F.sum((F.col("label") == 1).cast("long")).alias("pos_total")
+    )
+
+    res = probabilities.agg(*agg_cols).collect()[0]
+    pos_total = int(res["pos_total"] or 0)
+
+    rows = []
+    for thr in thresholds:
+        key = int(thr * 100)
+        tp = int(res[f"tp_{key}"] or 0)
+        fp = int(res[f"fp_{key}"] or 0)
+        alerts = tp + fp
+        precision = tp / alerts if alerts else 0.0
+        recall = tp / pos_total if pos_total else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
+        rows.append((model_name, float(thr), precision, recall, f1, alerts))
+    return rows
+
+
 def main():
     spark = build_session("evaluate_models")
 
@@ -103,7 +153,7 @@ def main():
     ))
 
     # 2. ML models — load + score.
-    for name, path, cls in MODELS:
+    for name, path, cls, _ in MODELS:
         precision, recall, f1, pr_auc, alerts = score_model(spark, name, path, cls, test)
         print(f"[evaluate] {name}  P={precision:.4f}  R={recall:.4f}  "
               f"F1={f1:.4f}  PR-AUC={pr_auc:.4f}  alerts={alerts:,}")
@@ -142,6 +192,54 @@ def main():
     # Print the final table so the stage3.sh log shows it explicitly.
     print("[evaluate] final comparison:")
     out.show(truncate=False)
+
+    # -------------------------------------------------------------------------
+    # 5. Threshold sweep — read each ML model's probabilities table (written
+    #    by train_models.py step 9) and compute (precision, recall, f1, alerts)
+    #    at multiple cutoffs in a single scan per model. This gives the report
+    #    the operating-point curve that the rule baseline can't produce.
+    # -------------------------------------------------------------------------
+    sweep_rows = []
+    for name, _path, _cls, model_dir in MODELS:
+        prob_path = f"project/output/{model_dir}_probabilities"
+        print(f"[evaluate] reading probabilities for {name} from {prob_path}")
+        probs = (spark.read
+                 .option("header", "true")
+                 .option("inferSchema", "true")
+                 .csv(prob_path))
+        model_sweep = threshold_sweep(probs, SWEEP_THRESHOLDS, name)
+        for r in model_sweep:
+            print(f"[evaluate]   thr={r[1]:.2f}  P={r[2]:.4f}  R={r[3]:.4f}  "
+                  f"F1={r[4]:.4f}  alerts={r[5]:,}")
+        sweep_rows.extend(model_sweep)
+
+    sweep = spark.createDataFrame(
+        sweep_rows,
+        schema="model string, threshold double, precision double, recall double, "
+               "f1 double, alert_volume long",
+    )
+    print(f"[evaluate] writing threshold sweep -> {HDFS_SWEEP}")
+    (sweep.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(HDFS_SWEEP))
+
+    # Hive external table for the sweep — also chartable in Superset.
+    spark.sql(f"DROP TABLE IF EXISTS {SWEEP_TABLE}")
+    spark.sql(
+        f"""CREATE EXTERNAL TABLE {SWEEP_TABLE} (
+                model        STRING,
+                threshold    DOUBLE,
+                precision    DOUBLE,
+                recall       DOUBLE,
+                f1           DOUBLE,
+                alert_volume BIGINT
+            )
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            STORED AS TEXTFILE
+            LOCATION '{HDFS_SWEEP}'
+            TBLPROPERTIES ('skip.header.line.count'='1')"""
+    )
 
     spark.stop()
 

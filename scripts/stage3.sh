@@ -158,6 +158,7 @@ if [[ "${SKIP_LR:-0}" != "1" ]]; then
     echo "============================================================"
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/models/model1" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_predictions" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_probabilities" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/train_models.py --model lr
 fi
@@ -171,6 +172,7 @@ if [[ "${SKIP_GBT:-0}" != "1" ]]; then
     echo "============================================================"
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/models/model2" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_predictions" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_probabilities" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/train_models.py --model gbt
 fi
@@ -186,6 +188,7 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_pattern_recall" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_weekend_weekday" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_at_fixed_recall" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_threshold_sweep" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/evaluate_models.py
 fi
@@ -230,6 +233,18 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
         echo "[stage3] -> $local_csv ($(($(wc -l < "$local_csv") - 1)) rows)"
     done
 
+    # 5c-bis. Probabilities CSV — (label, prediction, proba_positive). Used by
+    #         the threshold sweep in evaluate_models.py and kept separate from
+    #         the rubric-mandated _predictions CSV (which is label+prediction only).
+    for m in model1 model2; do
+        local_csv="output/${m}_probabilities.csv"
+        rm -f "$local_csv"
+        echo "label,prediction,proba_positive" > "$local_csv"
+        hdfs dfs -cat "${HDFS_USER}/project/output/${m}_probabilities/part-*.csv" \
+            2>/dev/null | tail -n +2 >> "$local_csv" || true
+        echo "[stage3] -> $local_csv ($(($(wc -l < "$local_csv") - 1)) rows)"
+    done
+
     # 5d. Evaluation CSV — same single-CSV treatment.
     rm -f output/evaluation.csv
     echo "model,precision,recall,f1,pr_auc,alert_volume" > output/evaluation.csv
@@ -237,6 +252,15 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
         | tail -n +2 >> output/evaluation.csv
     echo "[stage3] -> output/evaluation.csv:"
     cat output/evaluation.csv
+
+    # 5d-bis. Threshold sweep CSV — many rows per ML model (one per cutoff),
+    #         the operating-point curve the rule baseline can't produce.
+    rm -f output/eval_threshold_sweep.csv
+    echo "model,threshold,precision,recall,f1,alert_volume" > output/eval_threshold_sweep.csv
+    hdfs dfs -cat "${HDFS_USER}/project/output/eval_threshold_sweep/part-*.csv" \
+        2>/dev/null | tail -n +2 >> output/eval_threshold_sweep.csv || true
+    echo "[stage3] -> output/eval_threshold_sweep.csv:"
+    cat output/eval_threshold_sweep.csv
 
     # 5e. Pattern-recall breakdown (per-canonical-type, per-model).
     rm -f output/eval_pattern_recall.csv
