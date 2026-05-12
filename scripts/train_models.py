@@ -25,6 +25,7 @@ Why class weighting + downsampling combined?
     keep the original imbalance — reported metrics reflect deployment
     operating regime, not a training shortcut.
 """
+
 import argparse
 import sys
 
@@ -48,7 +49,7 @@ HDFS_TEST = "project/data/test_parquet"
 # but the full grid × 3 folds was multi-hour on HI-Medium; 1:20 cuts the
 # inner-loop training set ~2.5× without meaningfully changing PR-AUC
 # (negative-class signal saturates well before 1:50 at this scale).
-TARGET_NEG_PER_POS = 20
+TARGET_NEG_PER_POS = 35
 
 # Cross-validation folds. The course requires k>2; 3 is the minimum that
 # satisfies the rubric without 5× the training cost.
@@ -62,6 +63,7 @@ SEED = 42
 # Class-imbalance handling
 # -----------------------------------------------------------------------------
 
+
 def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEED):
     """Downsample negatives on the train split and attach a `weight` column.
 
@@ -72,9 +74,11 @@ def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEE
     neg = train.filter(F.col("label") == 0).cache()
     n_pos, n_neg = pos.count(), neg.count()
     if n_pos == 0:
-        raise RuntimeError("train split has zero positive examples — "
-                           "either the temporal cutoff is wrong or all "
-                           "laundering rows live in the test window")
+        raise RuntimeError(
+            "train split has zero positive examples — "
+            "either the temporal cutoff is wrong or all "
+            "laundering rows live in the test window"
+        )
 
     # Sample negatives to target ratio. Cap fraction at 1.0 in the
     # (unlikely) case the dataset is already balanced.
@@ -84,8 +88,10 @@ def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEE
 
     n_neg_sampled = neg_sampled.count()
     print(f"[train_models] pre-downsample : pos={n_pos:,}  neg={n_neg:,}")
-    print(f"[train_models] post-downsample: pos={n_pos:,}  neg={n_neg_sampled:,}  "
-          f"frac={frac:.6f}")
+    print(
+        f"[train_models] post-downsample: pos={n_pos:,}  neg={n_neg_sampled:,}  "
+        f"frac={frac:.6f}"
+    )
 
     # Class weight: balanced loss after downsampling.
     # pos_weight ≈ neg/pos so positive errors contribute equally to gradient.
@@ -103,6 +109,7 @@ def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEE
 # Model definitions
 # -----------------------------------------------------------------------------
 
+
 def build_logreg():
     """model1 — LogisticRegression (classical).
 
@@ -116,7 +123,7 @@ def build_logreg():
         labelCol="label",
         featuresCol="features",
         weightCol="weight",
-        maxIter=100,        # not in grid — training-control param
+        maxIter=100,  # not in grid — training-control param
         family="binomial",
         standardization=True,
     )
@@ -144,7 +151,7 @@ def build_gbt():
         labelCol="label",
         featuresCol="features",
         weightCol="weight",
-        maxIter=50,         # fixed — controls #trees, training param
+        maxIter=50,  # fixed — controls #trees, training param
         seed=SEED,
     )
     grid = (
@@ -157,7 +164,7 @@ def build_gbt():
 
 
 MODELS = {
-    "lr":  ("model1", build_logreg),
+    "lr": ("model1", build_logreg),
     "gbt": ("model2", build_gbt),
 }
 
@@ -166,11 +173,16 @@ MODELS = {
 # Main
 # -----------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, choices=list(MODELS),
-                        help="lr -> LogisticRegression (model1, classical); "
-                             "gbt -> GBTClassifier (model2, non-classical)")
+    parser.add_argument(
+        "--model",
+        required=True,
+        choices=list(MODELS),
+        help="lr -> LogisticRegression (model1, classical); "
+        "gbt -> GBTClassifier (model2, non-classical)",
+    )
     args = parser.parse_args()
     model_dir, builder = MODELS[args.model]
 
@@ -181,24 +193,29 @@ def main():
     test = spark.read.parquet(HDFS_TEST)
 
     # 2. Downsample negatives + attach class weights on train only, then
-    #    repartition to 2× executor cores (= 6 → bumped to 18 for inner
-    #    parallelism headroom under CV's parallelism=3) and cache. CV does
-    #    n_combos × numFolds passes over this set — caching once amortises
-    #    the downsample + orderBy(rand) shuffle across all of them.
+    #    repartition to 2× executor cores (15 cores → 30 partitions) so CV
+    #    inner stages run in two clean waves of 15 tasks instead of leaving
+    #    cores idle on a single tail wave. Cache because CV does
+    #    n_combos × numFolds passes over this set — caching amortises the
+    #    downsample + orderBy(rand) shuffle across all of them.
     train_balanced = (
         downsample_and_weight(train)
-        .repartition(18)
+        .repartition(30)
         .persist(StorageLevel.MEMORY_AND_DISK)
     )
     n_balanced = train_balanced.count()  # materialise the cache
-    print(f"[train_models] balanced train cached: {n_balanced:,} rows / "
-          f"{train_balanced.rdd.getNumPartitions()} partitions")
+    print(
+        f"[train_models] balanced train cached: {n_balanced:,} rows / "
+        f"{train_balanced.rdd.getNumPartitions()} partitions"
+    )
 
     # 3. Build estimator + hyperparameter grid.
     estimator, grid = builder()
     n_combos = len(grid)
-    print(f"[train_models] {args.model}: grid size = {n_combos} "
-          f"× {CV_FOLDS} folds = {n_combos * CV_FOLDS} fits")
+    print(
+        f"[train_models] {args.model}: grid size = {n_combos} "
+        f"× {CV_FOLDS} folds = {n_combos * CV_FOLDS} fits"
+    )
 
     # 4. CrossValidator — optimizes PR-AUC on the train fold, not ROC-AUC.
     #    PR-AUC is the right metric under heavy imbalance (ml.md §6).
@@ -228,8 +245,10 @@ def main():
     print(f"[train_models] {args.model}: fitting CrossValidator on train...")
     cv_model = cv.fit(train_balanced)
     best = cv_model.bestModel
-    print(f"[train_models] {args.model}: best params = "
-          f"{ {p.name: best.getOrDefault(p) for p in best.params if best.isSet(p)} }")
+    print(
+        f"[train_models] {args.model}: best params = "
+        f"{ {p.name: best.getOrDefault(p) for p in best.params if best.isSet(p)} }"
+    )
     print(f"[train_models] {args.model}: per-combo mean PR-AUC over folds:")
     for params, metric in zip(grid, cv_model.avgMetrics):
         compact = {k.name: v for k, v in params.items()}
@@ -263,12 +282,15 @@ def main():
     #    "Keep only label and prediction columns. Save it as one partition."
     pred_path = f"project/output/{model_dir}_predictions"
     print(f"[train_models] {args.model}: saving predictions -> {pred_path}")
-    (predictions
-        .select(F.col("label"), F.col("prediction").cast("int").alias("prediction"))
+    (
+        predictions.select(
+            F.col("label"), F.col("prediction").cast("int").alias("prediction")
+        )
         .coalesce(1)
         .write.mode("overwrite")
         .option("header", "true")
-        .csv(pred_path))
+        .csv(pred_path)
+    )
 
     # 9. Save probabilities CSV — (label, prediction, proba_positive) for
     #    threshold-sweep analysis in evaluate_models.py. Kept in a separate
@@ -281,8 +303,8 @@ def main():
     #    (Spark 3.0+), faster than a Python UDF.
     prob_path = f"project/output/{model_dir}_probabilities"
     print(f"[train_models] {args.model}: saving probabilities -> {prob_path}")
-    (predictions
-        .select(
+    (
+        predictions.select(
             F.col("label"),
             F.col("prediction").cast("int").alias("prediction"),
             vector_to_array("probability")[1].alias("proba_positive"),
@@ -290,7 +312,8 @@ def main():
         .coalesce(1)
         .write.mode("overwrite")
         .option("header", "true")
-        .csv(prob_path))
+        .csv(prob_path)
+    )
 
     predictions.unpersist()
     spark.stop()

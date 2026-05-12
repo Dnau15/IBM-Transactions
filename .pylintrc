@@ -25,6 +25,20 @@ disable=
     import-error,
     # PySpark uses camelCase for method/parameter names (saveAsTable, withColumn).
     invalid-name,
+    # Custom Transformer subclasses require multi-inheritance through pyspark's
+    # mixin chain (Transformer + HasInputCol + DefaultParamsReadable + Writable),
+    # which trips the default ancestor budget of 7.
+    too-many-ancestors,
+    # Custom Transformers and HDFS introspection both legitimately touch
+    # _-prefixed pyspark APIs (Params._dummy, spark._jvm, spark._jsc) — these
+    # are documented entry points for subclassing and Hadoop interop.
+    protected-access,
+    # The @keyword_only decorator hides argument usage: `inputCol`/`period`
+    # appear unused but are consumed by `self._input_kwargs`.
+    unused-argument,
+    # We rename `dataset` -> `df` in _transform overrides for local clarity;
+    # the dispatch is positional, so the rename is internal-only.
+    arguments-renamed,
 
     # --- Style choices we accept in research/glue scripts ------------------
     # Some module-level helpers don't need a one-liner docstring.
