@@ -97,15 +97,9 @@ echo "[stage3] (0/4) HDFS quota hygiene"
 echo "============================================================"
 hdfs dfs -expunge 2>/dev/null || true
 hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/.sparkStaging" 2>/dev/null || true
-hdfs dfs -count -q -h "${HDFS_USER}" 2>&1 | awk '
-NR==1 {print "[stage3] " $0}
-NR==2 {
-    print "[stage3] quota='\''$3"'\''  used='\''$4"'\''  files='\''$5"'\''  inodes='\''$6"'\'' "
-    # When --human-readable is on, fields 3/4 are like "32" "16.5" with the
-    # unit suffix glued to the trailing column 7 ($7 holds "G/user/team1").
-    # The awk above is informational only; the script-side budget check
-    # below uses a numeric (-v) form for accuracy.
-}'
+# Print the human-readable quota line with a [stage3] prefix. The numeric
+# budget check below is the authoritative gate; this is informational only.
+hdfs dfs -count -q -h "${HDFS_USER}" 2>&1 | sed 's/^/[stage3] /'
 # Bytes-precision budget check (skip with QUOTA_GUARD=0 for dev tinkering).
 if [[ "${QUOTA_GUARD:-1}" == "1" && -z "${SAMPLE_FRACTION:-}" && -z "${LIMIT_DAYS:-}" ]]; then
     # `hdfs dfs -count -q` columns (no -h, so all in bytes):
