@@ -159,6 +159,7 @@ if [[ "${SKIP_LR:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/models/model1" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_predictions" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_probabilities" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_cv_results" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/train_models.py --model lr
 fi
@@ -173,6 +174,7 @@ if [[ "${SKIP_GBT:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/models/model2" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_predictions" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_probabilities" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_cv_results" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/train_models.py --model gbt
 fi
@@ -189,6 +191,7 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_weekend_weekday" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_at_fixed_recall" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_threshold_sweep" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_value_sweep" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/evaluate_models.py
 fi
@@ -233,14 +236,27 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
         echo "[stage3] -> $local_csv ($(($(wc -l < "$local_csv") - 1)) rows)"
     done
 
-    # 5c-bis. Probabilities CSV — (label, prediction, proba_positive). Used by
-    #         the threshold sweep in evaluate_models.py and kept separate from
-    #         the rubric-mandated _predictions CSV (which is label+prediction only).
+    # 5c-bis. Probabilities CSV — (label, prediction, proba_positive,
+    #         amount_paid, payment_currency). Powers both the count-based
+    #         threshold sweep and the per-currency value sweep in
+    #         evaluate_models.py. Kept separate from the rubric-mandated
+    #         _predictions CSV (which is label+prediction only).
     for m in model1 model2; do
         local_csv="output/${m}_probabilities.csv"
         rm -f "$local_csv"
-        echo "label,prediction,proba_positive" > "$local_csv"
+        echo "label,prediction,proba_positive,amount_paid,payment_currency" > "$local_csv"
         hdfs dfs -cat "${HDFS_USER}/project/output/${m}_probabilities/part-*.csv" \
+            2>/dev/null | tail -n +2 >> "$local_csv" || true
+        echo "[stage3] -> $local_csv ($(($(wc -l < "$local_csv") - 1)) rows)"
+    done
+
+    # 5c-ter. CV grid results CSV — per-combo PR-AUC, one row per grid
+    #         entry, written by train_models.py for the Stage IV dashboard.
+    for m in model1 model2; do
+        local_csv="output/${m}_cv_results.csv"
+        rm -f "$local_csv"
+        echo "model,combo_idx,params,avg_pr_auc" > "$local_csv"
+        hdfs dfs -cat "${HDFS_USER}/project/output/${m}_cv_results/part-*.csv" \
             2>/dev/null | tail -n +2 >> "$local_csv" || true
         echo "[stage3] -> $local_csv ($(($(wc -l < "$local_csv") - 1)) rows)"
     done
@@ -261,6 +277,18 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
         2>/dev/null | tail -n +2 >> output/eval_threshold_sweep.csv || true
     echo "[stage3] -> output/eval_threshold_sweep.csv:"
     cat output/eval_threshold_sweep.csv
+
+    # 5d-ter. Value sweep CSV — per-currency dollar-recovery curve. One row
+    #         per (model, threshold, currency) cell. Drives the dashboard's
+    #         "money recovered" panel and the threshold-tuning discussion
+    #         in the report.
+    rm -f output/eval_value_sweep.csv
+    echo "model,threshold,currency,total_laundering_value,detected_value,false_positive_value,value_recall,value_precision,alerts" \
+        > output/eval_value_sweep.csv
+    hdfs dfs -cat "${HDFS_USER}/project/output/eval_value_sweep/part-*.csv" \
+        2>/dev/null | tail -n +2 >> output/eval_value_sweep.csv || true
+    echo "[stage3] -> output/eval_value_sweep.csv"
+    head -5 output/eval_value_sweep.csv
 
     # 5e. Pattern-recall breakdown (per-canonical-type, per-model).
     rm -f output/eval_pattern_recall.csv

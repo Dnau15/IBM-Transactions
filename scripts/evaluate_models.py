@@ -35,9 +35,26 @@ HDFS_EVAL = "project/output/evaluation"
 HDFS_RULE_OUT = "project/output/rule_baseline"
 # Threshold-sweep table: many rows per ML model, one per probability cutoff.
 HDFS_SWEEP = "project/output/eval_threshold_sweep"
+# Value-sweep table: per-currency dollar-recovery threshold sweep.
+HDFS_VALUE_SWEEP = "project/output/eval_value_sweep"
 
 EVALUATION_TABLE = f"{HIVE_DB}.evaluation"
 SWEEP_TABLE = f"{HIVE_DB}.eval_threshold_sweep"
+VALUE_SWEEP_TABLE = f"{HIVE_DB}.eval_value_sweep"
+
+# Currencies kept distinct in the value sweep; everything else folds into
+# "Other". Matches the bucketing already applied during feature engineering
+# in build_features.py so the report can cross-reference the two tables.
+VALUE_TOP_CURRENCIES = {
+    "US Dollar",
+    "Euro",
+    "Yuan",
+    "Yen",
+    "UK Pound",
+    "Ruble",
+    "Canadian Dollar",
+    "Australian Dollar",
+}
 
 MODELS = [
     ("model1_LogisticRegression", "project/models/model1", LogisticRegressionModel, "model1"),
@@ -127,6 +144,82 @@ def threshold_sweep(probabilities, thresholds, model_name):
     return rows
 
 
+def value_sweep(probabilities, thresholds, model_name):
+    """Per-currency value-based threshold sweep.
+
+    For every (currency_bucket, threshold) cell, compute:
+
+        total_laundering_value   sum(amount_paid where label=1)
+        detected_value           sum(amount_paid where label=1 and proba>=thr)
+        false_positive_value     sum(amount_paid where label=0 and proba>=thr)
+        value_recall             detected_value    / total_laundering_value
+        value_precision          detected_value    / (detected_value + false_positive_value)
+        alerts                   count(rows where proba>=thr)
+
+    Currencies outside the top-8 are folded into "Other" (matches the
+    feature-engineering bucket scope). All sums stay in the original
+    currency — no FX conversion is performed, so each row's values are
+    interpretable on their own without a synthetic exchange-rate
+    assumption.
+
+    Returns a list of
+        (model_name, threshold, currency, total_laundering_value,
+         detected_value, false_positive_value, value_recall,
+         value_precision, alerts).
+    """
+    # Bucket currencies before aggregating.
+    probs = probabilities.withColumn(
+        "currency_bucket",
+        F.when(F.col("payment_currency").isin(*VALUE_TOP_CURRENCIES),
+               F.col("payment_currency"))
+         .otherwise(F.lit("Other")),
+    )
+
+    # One scan per model, all thresholds inside.
+    agg_cols = [
+        F.sum(F.when(F.col("label") == 1, F.col("amount_paid")).otherwise(0.0))
+            .alias("pos_value"),
+    ]
+    for thr in thresholds:
+        key = int(thr * 100)
+        agg_cols.append(
+            F.sum(F.when(
+                (F.col("proba_positive") >= thr) & (F.col("label") == 1),
+                F.col("amount_paid"),
+            ).otherwise(0.0)).alias(f"tp_val_{key}")
+        )
+        agg_cols.append(
+            F.sum(F.when(
+                (F.col("proba_positive") >= thr) & (F.col("label") == 0),
+                F.col("amount_paid"),
+            ).otherwise(0.0)).alias(f"fp_val_{key}")
+        )
+        agg_cols.append(
+            F.sum((F.col("proba_positive") >= thr).cast("long"))
+                .alias(f"alerts_{key}")
+        )
+
+    grouped = probs.groupBy("currency_bucket").agg(*agg_cols).collect()
+
+    rows = []
+    for row in grouped:
+        currency = row["currency_bucket"]
+        pos_value = float(row["pos_value"] or 0.0)
+        for thr in thresholds:
+            key = int(thr * 100)
+            tp_val = float(row[f"tp_val_{key}"] or 0.0)
+            fp_val = float(row[f"fp_val_{key}"] or 0.0)
+            alerts = int(row[f"alerts_{key}"] or 0)
+            value_recall = tp_val / pos_value if pos_value > 0 else 0.0
+            denom = tp_val + fp_val
+            value_precision = tp_val / denom if denom > 0 else 0.0
+            rows.append((
+                model_name, float(thr), currency, pos_value, tp_val,
+                fp_val, value_recall, value_precision, alerts,
+            ))
+    return rows
+
+
 def main():
     spark = build_session("evaluate_models")
 
@@ -198,20 +291,33 @@ def main():
     #    by train_models.py step 9) and compute (precision, recall, f1, alerts)
     #    at multiple cutoffs in a single scan per model. This gives the report
     #    the operating-point curve that the rule baseline can't produce.
+    #    The same probabilities table is reused for the value sweep in step 6,
+    #    so we cache it once and unpersist after both sweeps run.
     # -------------------------------------------------------------------------
     sweep_rows = []
+    value_sweep_rows = []
     for name, _path, _cls, model_dir in MODELS:
         prob_path = f"project/output/{model_dir}_probabilities"
         print(f"[evaluate] reading probabilities for {name} from {prob_path}")
         probs = (spark.read
                  .option("header", "true")
                  .option("inferSchema", "true")
-                 .csv(prob_path))
+                 .csv(prob_path)
+                 .cache())
         model_sweep = threshold_sweep(probs, SWEEP_THRESHOLDS, name)
         for r in model_sweep:
             print(f"[evaluate]   thr={r[1]:.2f}  P={r[2]:.4f}  R={r[3]:.4f}  "
                   f"F1={r[4]:.4f}  alerts={r[5]:,}")
         sweep_rows.extend(model_sweep)
+
+        # Value sweep on the same cached probabilities.
+        model_value = value_sweep(probs, SWEEP_THRESHOLDS, name)
+        for r in model_value:
+            print(f"[evaluate]   val/{r[2]:<18s} thr={r[1]:.2f}  "
+                  f"vR={r[6]:.4f}  vP={r[7]:.4f}  "
+                  f"detected={r[4]:,.0f}  alerts={r[8]:,}")
+        value_sweep_rows.extend(model_value)
+        probs.unpersist()
 
     sweep = spark.createDataFrame(
         sweep_rows,
@@ -238,6 +344,46 @@ def main():
             ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
             STORED AS TEXTFILE
             LOCATION '{HDFS_SWEEP}'
+            TBLPROPERTIES ('skip.header.line.count'='1')"""
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Value sweep — per-currency dollar-recovery curve. Same threshold
+    #    grid as the count sweep, but the question is "what fraction of
+    #    laundered value is recovered" rather than "what fraction of
+    #    laundering rows is recovered". Tuning the production threshold on
+    #    value_recall vs alert volume is more decision-relevant for the FIU
+    #    than tuning on count-recall.
+    # -------------------------------------------------------------------------
+    value_sweep_df = spark.createDataFrame(
+        value_sweep_rows,
+        schema="model string, threshold double, currency string, "
+               "total_laundering_value double, detected_value double, "
+               "false_positive_value double, value_recall double, "
+               "value_precision double, alerts long",
+    )
+    print(f"[evaluate] writing value sweep -> {HDFS_VALUE_SWEEP}")
+    (value_sweep_df.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(HDFS_VALUE_SWEEP))
+
+    spark.sql(f"DROP TABLE IF EXISTS {VALUE_SWEEP_TABLE}")
+    spark.sql(
+        f"""CREATE EXTERNAL TABLE {VALUE_SWEEP_TABLE} (
+                model                  STRING,
+                threshold              DOUBLE,
+                currency               STRING,
+                total_laundering_value DOUBLE,
+                detected_value         DOUBLE,
+                false_positive_value   DOUBLE,
+                value_recall           DOUBLE,
+                value_precision        DOUBLE,
+                alerts                 BIGINT
+            )
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            STORED AS TEXTFILE
+            LOCATION '{HDFS_VALUE_SWEEP}'
             TBLPROPERTIES ('skip.header.line.count'='1')"""
     )
 

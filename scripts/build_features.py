@@ -228,6 +228,9 @@ DIAGNOSTIC_COLS = [
     "from_bank",
     "to_bank",
     "amount_paid",
+    # payment_currency is carried (un-bucketed) so the per-currency value
+    # sweep in evaluate_models.py can bucket it itself.
+    "payment_currency",
     "payment_format",
     "is_weekend",
     "day_of_week",

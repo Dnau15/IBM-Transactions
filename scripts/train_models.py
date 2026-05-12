@@ -36,7 +36,7 @@ from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import functions as F
 from pyspark.storagelevel import StorageLevel
 
-from spark_session import build_session
+from spark_session import HIVE_DB, build_session
 
 
 HDFS_TRAIN = "project/data/train_parquet"
@@ -250,9 +250,30 @@ def main():
         f"{ {p.name: best.getOrDefault(p) for p in best.params if best.isSet(p)} }"
     )
     print(f"[train_models] {args.model}: per-combo mean PR-AUC over folds:")
-    for params, metric in zip(grid, cv_model.avgMetrics):
+    cv_rows = []
+    for combo_idx, (params, metric) in enumerate(zip(grid, cv_model.avgMetrics)):
         compact = {k.name: v for k, v in params.items()}
+        param_summary = ", ".join(f"{k}={v}" for k, v in sorted(compact.items()))
         print(f"    PR-AUC={metric:.6f}   {compact}")
+        cv_rows.append(
+            (args.model, combo_idx, param_summary, float(metric))
+        )
+
+    # 5b. Persist CV grid + per-combo PR-AUC so the Stage IV dashboard can
+    #     plot hyperparameter-search outcomes (rubric line: "results of
+    #     hyper-parameter optimization"). One row per (model, combo).
+    cv_path = f"project/output/{model_dir}_cv_results"
+    print(f"[train_models] {args.model}: saving CV grid results -> {cv_path}")
+    cv_df = spark.createDataFrame(
+        cv_rows,
+        schema="model string, combo_idx int, params string, avg_pr_auc double",
+    )
+    (
+        cv_df.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(cv_path)
+    )
 
     # Release the cached train set — the rest of main only touches test.
     train_balanced.unpersist()
@@ -264,13 +285,20 @@ def main():
     best.write().overwrite().save(model_path)
 
     # 7. Predict on the held-out test split (original imbalance, NO weights).
-    #    Project to only the columns we need (label, prediction, probability,
-    #    rawPrediction) and cache — we will do three actions on this DF:
-    #    PR-AUC eval, predictions CSV write, probabilities CSV write.
+    #    Carry `amount_paid` and `payment_currency` through so the
+    #    probabilities table can support the per-currency value sweep in
+    #    evaluate_models.py without re-scoring the test set.
     print(f"[train_models] {args.model}: scoring test split")
     predictions = (
         best.transform(test)
-        .select("label", "prediction", "probability", "rawPrediction")
+        .select(
+            "label",
+            "prediction",
+            "probability",
+            "rawPrediction",
+            "amount_paid",
+            "payment_currency",
+        )
         .persist(StorageLevel.MEMORY_AND_DISK)
     )
 
@@ -292,10 +320,11 @@ def main():
         .csv(pred_path)
     )
 
-    # 9. Save probabilities CSV — (label, prediction, proba_positive) for
-    #    threshold-sweep analysis in evaluate_models.py. Kept in a separate
-    #    output path so the rubric-mandated _predictions table stays
-    #    schema-pure (label, prediction only).
+    # 9. Save probabilities CSV — (label, prediction, proba_positive,
+    #    amount_paid, payment_currency). The rubric-mandated _predictions
+    #    table above stays schema-pure (label, prediction only); this wider
+    #    artefact powers both the count-based threshold sweep and the
+    #    per-currency value sweep in evaluate_models.py.
     #
     #    `probability` is a length-2 Vector for binary classification —
     #    [P(class 0), P(class 1)] — so index 1 is the positive class
@@ -308,6 +337,8 @@ def main():
             F.col("label"),
             F.col("prediction").cast("int").alias("prediction"),
             vector_to_array("probability")[1].alias("proba_positive"),
+            F.col("amount_paid").cast("double").alias("amount_paid"),
+            F.col("payment_currency").alias("payment_currency"),
         )
         .coalesce(1)
         .write.mode("overwrite")
@@ -316,6 +347,64 @@ def main():
     )
 
     predictions.unpersist()
+
+    # 10. Register Hive external tables over the three CSV outputs so the
+    #     Stage IV Apache Superset dashboard can read them directly from
+    #     the Hive metastore (rubric: "Create external Hive tables for
+    #     results of stage III"). Each TBLPROPERTIES skips the CSV header
+    #     row. Paths are absolute to avoid the Spark-vs-Hive relative-path
+    #     resolution mismatch documented in build_features.py.
+    pred_table = f"{HIVE_DB}.{model_dir}_predictions"
+    prob_table = f"{HIVE_DB}.{model_dir}_probabilities"
+    cv_table = f"{HIVE_DB}.{model_dir}_cv_results"
+    pred_abs = f"/user/team1/{pred_path}"
+    prob_abs = f"/user/team1/{prob_path}"
+    cv_abs = f"/user/team1/{cv_path}"
+
+    print(f"[train_models] {args.model}: registering Hive table {pred_table}")
+    spark.sql(f"DROP TABLE IF EXISTS {pred_table}")
+    spark.sql(
+        f"""CREATE EXTERNAL TABLE {pred_table} (
+                label      INT,
+                prediction INT
+            )
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            STORED AS TEXTFILE
+            LOCATION '{pred_abs}'
+            TBLPROPERTIES ('skip.header.line.count'='1')"""
+    )
+
+    print(f"[train_models] {args.model}: registering Hive table {prob_table}")
+    spark.sql(f"DROP TABLE IF EXISTS {prob_table}")
+    spark.sql(
+        f"""CREATE EXTERNAL TABLE {prob_table} (
+                label            INT,
+                prediction       INT,
+                proba_positive   DOUBLE,
+                amount_paid      DOUBLE,
+                payment_currency STRING
+            )
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            STORED AS TEXTFILE
+            LOCATION '{prob_abs}'
+            TBLPROPERTIES ('skip.header.line.count'='1')"""
+    )
+
+    print(f"[train_models] {args.model}: registering Hive table {cv_table}")
+    spark.sql(f"DROP TABLE IF EXISTS {cv_table}")
+    spark.sql(
+        f"""CREATE EXTERNAL TABLE {cv_table} (
+                model      STRING,
+                combo_idx  INT,
+                params     STRING,
+                avg_pr_auc DOUBLE
+            )
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            STORED AS TEXTFILE
+            LOCATION '{cv_abs}'
+            TBLPROPERTIES ('skip.header.line.count'='1')"""
+    )
+
     spark.stop()
 
 
