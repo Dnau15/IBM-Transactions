@@ -5,7 +5,7 @@ Each model is:
     * fit on the training split with class-weighted loss + negative
       downsampling on the training set ONLY (val/test untouched);
     * hyperparameter-optimized via ParamGridBuilder + CrossValidator
-      (k=3 folds, ≥3 model hyperparameters per the course rubric);
+      (k=3 folds, 2 model hyperparameters per the course rubric);
     * persisted to project/models/modelN on HDFS;
     * scored on the held-out test split → predictions CSV at
       project/output/modelN_predictions/.
@@ -130,11 +130,13 @@ def build_logreg():
 def build_gbt():
     """model2 — GBTClassifier (non-classical / boosting).
 
-    Per the Stage III rubric we tune exactly two *model* hyperparameters
-    (both are structural parameters of the learner, not training
-    controls like `maxIter` or `subsamplingRate`):
-        maxDepth — depth of each weak learner (model capacity)
-        stepSize — boosting learning rate (shrinkage)
+    Per the Stage III rubric we tune two *model* hyperparameters that are
+    structural properties of the learner, not training controls like
+    `maxIter` or `stepSize` (learning-rate-style knobs):
+        maxDepth         — depth of each weak learner (model capacity)
+        subsamplingRate  — fraction of training rows each tree sees
+                           (row-level bagging — a structural property of
+                           the ensemble, not a stopping criterion)
     """
     gbt = GBTClassifier(
         labelCol="label",
@@ -146,7 +148,7 @@ def build_gbt():
     grid = (
         ParamGridBuilder()
         .addGrid(gbt.maxDepth, [3, 5, 7])
-        .addGrid(gbt.stepSize, [0.05, 0.1])
+        .addGrid(gbt.subsamplingRate, [0.7, 1.0])
         .build()
     )
     return gbt, grid

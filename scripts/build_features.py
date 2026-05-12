@@ -2,7 +2,9 @@
 
 Reads team1_projectdb.transactions, adds past-only window aggregates per
 account (in/out, multiple time horizons), one-hot encodes payment_format
-and currency buckets, then temporally splits the result 80/20 by ts.
+and currency buckets, sin/cos-encodes the cyclical time parts via a custom
+pyspark.ml.Transformer (Stage III rubric Note1), then temporally splits
+the result 80/20 by ts.
 
 Outputs (HDFS, paths relative to /user/team1):
     project/data/features              full feature table, Parquet+Snappy
@@ -24,13 +26,18 @@ Temporal discipline (see ml.md §2):
       retro-fit-leaked.
 """
 import logging
+import math
 import os
 import sys
 import time
 from contextlib import contextmanager
 
-from pyspark.ml import Pipeline
+from pyspark import keyword_only
+from pyspark.ml import Pipeline, Transformer
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
+from pyspark.ml.param import Param, Params, TypeConverters
+from pyspark.ml.param.shared import HasInputCol
+from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
@@ -142,12 +149,20 @@ BANK_PRIOR_ALPHA = 20
 #                           midday rate is 2-3× weekday baseline.
 #   log10_amount_bucket   — integer bin matching q11 buckets; laundering
 #                           is right-shifted vs legit on the amount axis.
+#   hour_of_day_{sin,cos} — cyclical encoding of hour produced by the
+#   day_of_week_{sin,cos}   SinCosEncoder pipeline stages (rubric Note1).
+#                           Raw integer columns are retained so trees can
+#                           split on them directly without re-deriving.
 ROW_NUMERIC = [
     "log_amount",
     "log10_amount_bucket",
     "currency_mismatch",
     "hour_of_day",
+    "hour_of_day_sin",
+    "hour_of_day_cos",
     "day_of_week",
+    "day_of_week_sin",
+    "day_of_week_cos",
     "is_weekend",
 ]
 
@@ -485,6 +500,56 @@ def build_features(spark):
 
 
 # -----------------------------------------------------------------------------
+# Cyclical encoding (Stage III rubric Note1)
+# -----------------------------------------------------------------------------
+
+class SinCosEncoder(
+    Transformer,
+    HasInputCol,
+    DefaultParamsReadable,
+    DefaultParamsWritable,
+):
+    """Map a cyclical integer column to its (sin, cos) pair.
+
+    Output columns are `{inputCol}_sin` and `{inputCol}_cos`. `period` is the
+    cycle length: 24 for hour_of_day, 7 for Spark's dayofweek (1..7). The
+    DefaultParamsReadable/Writable mixins let the fitted PipelineModel
+    round-trip through save/load; loading requires build_features.py on the
+    Python path so the qualified class name resolves.
+    """
+
+    period = Param(
+        Params._dummy(),
+        "period",
+        "cycle length (24 for hour, 7 for day-of-week)",
+        typeConverter=TypeConverters.toFloat,
+    )
+
+    @keyword_only
+    def __init__(self, inputCol=None, period=None):
+        super().__init__()
+        self._setDefault(period=0.0)
+        kwargs = self._input_kwargs
+        self.setParams(**kwargs)
+
+    @keyword_only
+    def setParams(self, inputCol=None, period=None):
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
+
+    def getPeriod(self):
+        return self.getOrDefault(self.period)
+
+    def _transform(self, df):
+        col = self.getInputCol()
+        angle = F.lit(2.0 * math.pi) * F.col(col).cast("double") / F.lit(float(self.getPeriod()))
+        return (
+            df.withColumn(f"{col}_sin", F.sin(angle))
+              .withColumn(f"{col}_cos", F.cos(angle))
+        )
+
+
+# -----------------------------------------------------------------------------
 # Encoding pipeline
 # -----------------------------------------------------------------------------
 
@@ -496,6 +561,12 @@ def build_pipeline():
     because temporal split can move a rare payment format entirely into
     the test window.
     """
+    # Cyclical time parts first — they generate hour_of_day_sin/cos and
+    # day_of_week_sin/cos columns that NUMERIC_FEATURES references.
+    sincos_stages = [
+        SinCosEncoder(inputCol="hour_of_day", period=24.0),
+        SinCosEncoder(inputCol="day_of_week", period=7.0),
+    ]
     indexers = [
         StringIndexer(
             inputCol=col,
@@ -522,7 +593,7 @@ def build_pipeline():
         # Should be rare in practice — most accounts transact more than once.
         handleInvalid="skip",
     )
-    return Pipeline(stages=indexers + encoders + [assembler])
+    return Pipeline(stages=sincos_stages + indexers + encoders + [assembler])
 
 
 # -----------------------------------------------------------------------------
@@ -713,8 +784,10 @@ def main():
 
         # Log learned category vocabularies so we can sanity-check that
         # the StringIndexer saw what we expected (no surprise NULLs).
-        # The first len(CATEGORICAL_FEATURES) stages are the indexers.
-        for col, model in zip(CATEGORICAL_FEATURES, pipeline_model.stages[:len(CATEGORICAL_FEATURES)]):
+        # Pick StringIndexerModel stages by their `.labels` attribute so
+        # this stays correct as we add/reorder other pipeline stages.
+        indexer_stages = [s for s in pipeline_model.stages if hasattr(s, "labels")]
+        for col, model in zip(CATEGORICAL_FEATURES, indexer_stages):
             log.info("    indexer[%s] learned labels = %s",
                      col, list(model.labels))
 

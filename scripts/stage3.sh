@@ -278,15 +278,18 @@ if [[ "${SKIP_PYLINT:-0}" != "1" ]]; then
     echo "[stage3] (6) pylint scripts"
     echo "============================================================"
     if command -v pylint >/dev/null 2>&1; then
-        # --rcfile picks up .pylintrc at the repo root if present;
-        # falls back to defaults otherwise. --exit-zero so a non-clean
-        # run doesn't kill the bash script (we still see the score).
-        pylint --rcfile=.pylintrc --exit-zero \
-            scripts/spark_session.py \
-            scripts/build_features.py \
-            scripts/rule_baseline.py \
-            scripts/train_models.py \
-            scripts/evaluate_models.py \
+        # Resolve .pylintrc to an absolute path so pylint finds it
+        # regardless of the cwd it was launched in (some pip-installed
+        # pylint wrappers chdir before parsing --rcfile, which made the
+        # old relative path silently fall back to default rules).
+        # --exit-zero so a non-clean run doesn't kill the bash script.
+        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        pylint --rcfile="${REPO_ROOT}/.pylintrc" --exit-zero \
+            "${REPO_ROOT}/scripts/spark_session.py" \
+            "${REPO_ROOT}/scripts/build_features.py" \
+            "${REPO_ROOT}/scripts/rule_baseline.py" \
+            "${REPO_ROOT}/scripts/train_models.py" \
+            "${REPO_ROOT}/scripts/evaluate_models.py" \
             | tee output/pylint.txt
         echo "[stage3] -> output/pylint.txt"
     else
