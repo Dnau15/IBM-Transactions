@@ -72,6 +72,63 @@ PY_FILES="scripts/spark_session.py,scripts/build_features.py"
 mkdir -p data models output
 
 # -----------------------------------------------------------------------------
+# 0. HDFS quota hygiene.
+#
+# /user/team1 has a 32 GB raw (replicated) quota = ~10.7 GB unique data.
+# A previous build_features run busted it at step 9 (JSON splits write) —
+# Spark retried task 0 four times against DSQuotaExceededException, then
+# aborted the whole job.  Two routine sources of bloat fix this for good:
+#
+#   a) `.Trash` — every prior `hdfs dfs -rm` without -skipTrash sits here
+#      until manually purged.  Easily 8-10 GB after a week of iteration.
+#      `hdfs dfs -expunge` empties it.
+#
+#   b) The Spark staging dir under `.sparkStaging` — usually cleaned by
+#      driver shutdown, but lingers if a previous YARN app was killed.
+#      Safe to wipe; live YARN apps hold their own subdir by app-id and
+#      will recreate as needed.
+#
+# After cleanup we print the resulting quota state so the run log shows
+# exactly how much headroom we started with, and fail fast if the budget
+# left is below the minimum needed for a full-data build_features run.
+# -----------------------------------------------------------------------------
+echo "============================================================"
+echo "[stage3] (0/4) HDFS quota hygiene"
+echo "============================================================"
+hdfs dfs -expunge 2>/dev/null || true
+hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/.sparkStaging" 2>/dev/null || true
+hdfs dfs -count -q -h "${HDFS_USER}" 2>&1 | awk '
+NR==1 {print "[stage3] " $0}
+NR==2 {
+    print "[stage3] quota='\''$3"'\''  used='\''$4"'\''  files='\''$5"'\''  inodes='\''$6"'\'' "
+    # When --human-readable is on, fields 3/4 are like "32" "16.5" with the
+    # unit suffix glued to the trailing column 7 ($7 holds "G/user/team1").
+    # The awk above is informational only; the script-side budget check
+    # below uses a numeric (-v) form for accuracy.
+}'
+# Bytes-precision budget check (skip with QUOTA_GUARD=0 for dev tinkering).
+if [[ "${QUOTA_GUARD:-1}" == "1" && -z "${SAMPLE_FRACTION:-}" && -z "${LIMIT_DAYS:-}" ]]; then
+    # `hdfs dfs -count -q` columns (no -h, so all in bytes):
+    #   QUOTA  REMAINING_QUOTA  SPACE_QUOTA  REMAINING_SPACE_QUOTA  ...
+    # We want columns 3 (total) and 4 (remaining = avail = quota − used).
+    read -r _ _ quota avail _ < <(hdfs dfs -count -q "${HDFS_USER}" 2>/dev/null | tail -1)
+    if [[ "$quota" =~ ^[0-9]+$ && "$avail" =~ ^[0-9]+$ ]]; then
+        # Empirically ~12 GB replicated headroom is enough for the full-data
+        # build_features step 8+9 (Parquet splits + gzipped JSON splits).
+        min_avail=$(( 12 * 1024 * 1024 * 1024 ))
+        if (( avail < min_avail )); then
+            echo "[stage3] ERROR: only $(( avail / 1024 / 1024 ))MB of HDFS quota free."
+            echo "[stage3]        need at least $(( min_avail / 1024 / 1024 ))MB for a full-data run."
+            echo "[stage3]        either free space (du -h, then targeted hdfs dfs -rm -skipTrash),"
+            echo "[stage3]        run with LIMIT_DAYS=N or SAMPLE_FRACTION=F, or set QUOTA_GUARD=0."
+            exit 1
+        fi
+        echo "[stage3] quota OK: $(( avail / 1024 / 1024 ))MB free, "\
+"$(( min_avail / 1024 / 1024 ))MB minimum"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
 # 1. Feature engineering + temporal split
 # -----------------------------------------------------------------------------
 if [[ "${SKIP_FEATURES:-0}" != "1" ]]; then
@@ -152,9 +209,12 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
     # 5a. Train / test JSON — concat HDFS part files into a single
     #     local file (we coalesce(1) in build_features.py, so there's only
     #     one part-*.json each; -cat ... still works for safety).
+    # `hdfs dfs -text` transparently decompresses .gz part files written by
+    # build_features.py (we gzip the JSON to stay under the 32 GB HDFS quota).
+    # Works the same for plain .json if compression is later disabled.
     rm -f data/train.json data/test.json
-    hdfs dfs -cat "${HDFS_USER}/project/data/train/part-*.json" > data/train.json
-    hdfs dfs -cat "${HDFS_USER}/project/data/test/part-*.json"  > data/test.json
+    hdfs dfs -text "${HDFS_USER}/project/data/train/part-*" > data/train.json
+    hdfs dfs -text "${HDFS_USER}/project/data/test/part-*"  > data/test.json
     echo "[stage3] -> data/train.json  ($(wc -l < data/train.json) lines)"
     echo "[stage3] -> data/test.json   ($(wc -l < data/test.json) lines)"
 

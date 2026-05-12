@@ -739,19 +739,31 @@ def main():
     # -------------------------------------------------------------------------
     # 8. Write JSON splits (rubric deliverable). We strip diagnostic cols
     #    here — the rubric example shows {features, label} only — and
-    #    coalesce(1) so the downstream `hdfs dfs -cat .../part-*.json >
-    #    data/train.json` is a single concat. The Vector becomes a struct
-    #    in JSON; that's fine for the grader to read, not consumed by our
-    #    own training code (which reads Parquet).
+    #    coalesce(1) so the downstream `hdfs dfs -cat .../part-*.json.gz >
+    #    data/train.json.gz` is a single concat. The Vector becomes a
+    #    struct in JSON; that's fine for the grader to read, not consumed
+    #    by our own training code (which reads Parquet).
+    #
+    #    GZIP COMPRESSION: an uncompressed JSON serialisation of ~50-dim
+    #    Vector + label across ~25M rows is 5-10 GB *per split*, and at
+    #    HDFS 3× replication it busts the /user/team1 32 GB quota at
+    #    write time (this is exactly what killed the 2026-05-12 07:41 run).
+    #    gzip cuts each split ~5×; stage3.sh's pull step uses `hdfs dfs
+    #    -text` (which transparently decompresses) so the local artifact
+    #    can still land as `data/{train,test}.json.gz`.
     # -------------------------------------------------------------------------
     with step("write JSON splits (rubric deliverable) + pipeline model"):
-        log.info("writing train json -> %s", HDFS_TRAIN_JSON)
+        log.info("writing train json (gzip) -> %s", HDFS_TRAIN_JSON)
         (train.select("features", "label").coalesce(1)
-            .write.mode("overwrite").format("json").save(HDFS_TRAIN_JSON))
-        log.info("writing test  json -> %s", HDFS_TEST_JSON)
+            .write.mode("overwrite").format("json")
+            .option("compression", "gzip")
+            .save(HDFS_TRAIN_JSON))
+        log.info("writing test  json (gzip) -> %s", HDFS_TEST_JSON)
         (test.select("features", "label").coalesce(1)
-            .write.mode("overwrite").format("json").save(HDFS_TEST_JSON))
-        log.info("writing pipeline   -> %s", HDFS_PIPELINE)
+            .write.mode("overwrite").format("json")
+            .option("compression", "gzip")
+            .save(HDFS_TEST_JSON))
+        log.info("writing pipeline          -> %s", HDFS_PIPELINE)
         pipeline_model.write().overwrite().save(HDFS_PIPELINE)
 
     # -------------------------------------------------------------------------

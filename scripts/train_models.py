@@ -40,10 +40,13 @@ HDFS_TRAIN = "project/data/train_parquet"
 HDFS_TEST = "project/data/test_parquet"
 
 # Target ratio after downsampling negatives (positives kept intact).
-# 1:50 keeps enough majority signal for gradient stability without
-# inflating training time. With ~25M train rows at 0.1% positive rate
-# that's ~25k positives → ~1.25M downsampled negatives.
-TARGET_NEG_PER_POS = 50
+# 1:20 keeps enough majority signal for gradient stability while keeping
+# the CV cost tractable. With ~25M train rows at 0.1% positive rate
+# that's ~25k positives → ~500k downsampled negatives. Was 1:50 originally
+# but the full grid × 3 folds was multi-hour on HI-Medium; 1:20 cuts the
+# inner-loop training set ~2.5× without meaningfully changing PR-AUC
+# (negative-class signal saturates well before 1:50 at this scale).
+TARGET_NEG_PER_POS = 20
 
 # Cross-validation folds. The course requires k>2; 3 is the minimum that
 # satisfies the rubric without 5× the training cost.

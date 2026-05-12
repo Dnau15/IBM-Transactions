@@ -603,14 +603,16 @@ def plot_q18(df: pd.DataFrame, name: str) -> None:
     ax.set_xlabel("Distinct banks involved in pattern")
     ax.set_ylabel("Canonical pattern type")
     ax.set_title("q18 — Pattern x bank-scope (log10 pattern instances)")
-    # Cell annotations with raw counts.
+    # Cell annotations with raw counts. magma goes dark -> bright as the
+    # value increases, so use white text on the *dark* (low-value) end
+    # and black text on the *bright* (high-value) end.
     for i, ptype in enumerate(CANONICAL_PATTERNS):
         for j, b in enumerate(bucket_order):
             v = int(grid.loc[ptype, b]) if ptype in grid.index else 0
             if v:
                 ax.text(j, i, f"{v}", ha="center", va="center",
                         fontsize=7,
-                        color="white" if np.log10(v + 1) > 1.5 else "black")
+                        color="black" if np.log10(v + 1) > 1.5 else "white")
     fig.colorbar(im, ax=ax, label="log10(n + 1)")
     _save(fig, name)
 
