@@ -101,16 +101,17 @@ def downsample_and_weight(train, target_neg_per_pos=TARGET_NEG_PER_POS, seed=SEE
 def build_logreg():
     """model1 — LogisticRegression (classical).
 
-    Three model hyperparameters in the grid (per rubric):
-        regParam        — L2 strength
+    Per the Stage III rubric we tune exactly two *model* hyperparameters
+    (i.e. parameters that change the hypothesis class, not training
+    controls like `maxIter` or `aggregationDepth`):
+        regParam        — L2 strength (regularization weight)
         elasticNetParam — L1/L2 mix (0 = pure L2, 1 = pure L1)
-        aggregationDepth — tree-aggregation depth (per tutorial example)
     """
     lr = LogisticRegression(
         labelCol="label",
         featuresCol="features",
         weightCol="weight",
-        maxIter=100,        # not in grid — sufficient for convergence
+        maxIter=100,        # not in grid — training-control param
         family="binomial",
         standardization=True,
     )
@@ -118,7 +119,6 @@ def build_logreg():
         ParamGridBuilder()
         .addGrid(lr.regParam, [0.001, 0.01, 0.1])
         .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
-        .addGrid(lr.aggregationDepth, [2, 4])
         .build()
     )
     return lr, grid
@@ -127,24 +127,23 @@ def build_logreg():
 def build_gbt():
     """model2 — GBTClassifier (non-classical / boosting).
 
-    Three model hyperparameters in the grid (per rubric — all are
-    structural model parameters, not training-control like maxIter):
-        maxDepth         — depth of each weak learner
-        stepSize         — boosting learning rate
-        subsamplingRate  — stochastic boosting fraction
+    Per the Stage III rubric we tune exactly two *model* hyperparameters
+    (both are structural parameters of the learner, not training
+    controls like `maxIter` or `subsamplingRate`):
+        maxDepth — depth of each weak learner (model capacity)
+        stepSize — boosting learning rate (shrinkage)
     """
     gbt = GBTClassifier(
         labelCol="label",
         featuresCol="features",
         weightCol="weight",
-        maxIter=50,         # fixed — controls #trees, not in grid (training param)
+        maxIter=50,         # fixed — controls #trees, training param
         seed=SEED,
     )
     grid = (
         ParamGridBuilder()
         .addGrid(gbt.maxDepth, [3, 5, 7])
         .addGrid(gbt.stepSize, [0.05, 0.1])
-        .addGrid(gbt.subsamplingRate, [0.7, 1.0])
         .build()
     )
     return gbt, grid
