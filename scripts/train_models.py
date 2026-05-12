@@ -216,6 +216,32 @@ def main():
         compact = {k.name: v for k, v in params.items()}
         print(f"    PR-AUC={metric:.6f}   {compact}")
 
+    # 5b. Persist the per-combo CV results so the Stage IV dashboard can chart
+    #     the hyperparameter sweep, not just the best cell. Long form (one row
+    #     per (combo, param)) keeps the schema identical across LR / GBT
+    #     despite their different param names.
+    combo_rows = []
+    for combo_id, (params, metric) in enumerate(zip(grid, cv_model.avgMetrics)):
+        for p, v in params.items():
+            combo_rows.append((
+                f"{model_dir}_{type(estimator).__name__}",
+                int(combo_id),
+                p.name,
+                str(v),
+                float(metric),
+            ))
+    cv_df = spark.createDataFrame(
+        combo_rows,
+        schema=("model string, combo_id int, param_name string, "
+                "param_value string, pr_auc double"),
+    )
+    cv_path = f"project/output/cv_results_{model_dir}"
+    print(f"[train_models] {args.model}: saving CV sweep -> {cv_path}")
+    (cv_df.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(cv_path))
+
     # 6. Save best model. The CrossValidatorModel itself is not persisted —
     #    only the best fitted estimator, which is what evaluate_models.py loads.
     model_path = f"project/models/{model_dir}"

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Root orchestrator: runs Stage I, Stage II and Stage III end-to-end.
+# Root orchestrator: runs Stages I → IV end-to-end.
 # Default skips the format/codec benchmark in Stage I (8 sequential
 # sqoops, ~30 min). Pass --with-bench to include it.
 #
+# Stage IV's Superset dashboard authoring is manual per rubric; stage4.sh
+# automates everything up to and including the Hive externals + pylint
+# that the dashboard reads through.
+#
 # Usage:
-#   bash main.sh                # stages 1 + 2 + 3, no benchmark
-#   bash main.sh --with-bench   # stages 1 + 2 + 3 + benchmark sweep
+#   bash main.sh                # stages 1 + 2 + 3 + 4, no benchmark
+#   bash main.sh --with-bench   # also run the benchmark sweep
 set -euo pipefail
 
 WITH_BENCH=0
@@ -18,7 +22,7 @@ done
 
 export WITH_BENCH
 
-chmod +x scripts/stage1.sh scripts/stage2.sh scripts/stage3.sh
+chmod +x scripts/stage1.sh scripts/stage2.sh scripts/stage3.sh scripts/stage4.sh
 
 ./scripts/stage1.sh
 
@@ -34,5 +38,6 @@ fi
 
 ./scripts/stage2.sh
 ./scripts/stage3.sh
+./scripts/stage4.sh
 
 echo "[main] all stages complete."
