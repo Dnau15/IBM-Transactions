@@ -187,11 +187,11 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
     echo "[stage3] (4/4) evaluate_models.py"
     echo "============================================================"
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/evaluation" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_threshold_sweep" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_value_sweep" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_pattern_recall" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_weekend_weekday" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_at_fixed_recall" || true
-    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_threshold_sweep" || true
-    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_value_sweep" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/evaluate_models.py
 fi
@@ -292,7 +292,7 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
 
     # 5e. Pattern-recall breakdown (per-canonical-type, per-model).
     rm -f output/eval_pattern_recall.csv
-    echo "model,canon_type,n_groups,n_caught,recall" > output/eval_pattern_recall.csv
+    echo "model,canon_type,n_total,n_caught,recall" > output/eval_pattern_recall.csv
     hdfs dfs -cat "${HDFS_USER}/project/output/eval_pattern_recall/part-*.csv" \
         2>/dev/null | tail -n +2 >> output/eval_pattern_recall.csv || true
     echo "[stage3] -> output/eval_pattern_recall.csv"
