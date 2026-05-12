@@ -6,6 +6,10 @@ secrets/*
 data/*
 output/*
 !data/.gitkeep
+docs/
+dashboard_example/
+superset/
+eda/
 report/
 project_reqs/
 __pycache__/
