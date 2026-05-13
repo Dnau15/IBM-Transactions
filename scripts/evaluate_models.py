@@ -25,6 +25,7 @@ import sys
 
 from pyspark.ml.classification import GBTClassificationModel, LogisticRegressionModel
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.functions import vector_to_array
 from pyspark.sql import functions as F
 
 from spark_session import HIVE_DB, build_session
@@ -40,14 +41,12 @@ HDFS_VALUE_SWEEP = "project/output/eval_value_sweep"
 # Diagnostic breakdown tables (Stage IV dashboard inputs).
 HDFS_PATTERN_RECALL = "project/output/eval_pattern_recall"
 HDFS_WEEKEND_WEEKDAY = "project/output/eval_weekend_weekday"
-HDFS_FIXED_RECALL = "project/output/eval_at_fixed_recall"
 
 EVALUATION_TABLE = f"{HIVE_DB}.evaluation"
 SWEEP_TABLE = f"{HIVE_DB}.eval_threshold_sweep"
 VALUE_SWEEP_TABLE = f"{HIVE_DB}.eval_value_sweep"
 PATTERN_RECALL_TABLE = f"{HIVE_DB}.eval_pattern_recall"
 WEEKEND_WEEKDAY_TABLE = f"{HIVE_DB}.eval_weekend_weekday"
-FIXED_RECALL_TABLE = f"{HIVE_DB}.eval_at_fixed_recall"
 
 # Currencies kept distinct in the value sweep; everything else folds into
 # "Other". Matches the bucketing already applied during feature engineering
@@ -72,20 +71,10 @@ CANONICAL_PATTERNS = sorted([
     "CYCLE", "RANDOM", "BIPARTITE", "STACK",
 ], key=len, reverse=True)
 
-# Operating-point recall targets reported by `at_fixed_recall`. These are
-# the points an FIU would normally consider when sizing analyst capacity.
-FIXED_RECALL_TARGETS = [0.50, 0.70, 0.90]
-
 MODELS = [
     ("model1_LogisticRegression", "project/models/model1", LogisticRegressionModel, "model1"),
     ("model2_GBTClassifier",      "project/models/model2", GBTClassificationModel,  "model2"),
 ]
-
-# Probability cutoffs swept in evaluation. Default-threshold 0.5 is included
-# so the sweep table aligns with the evaluation.csv operating point. Upper
-# end (0.95) is where the high-precision, low-volume regime lives at this
-# prevalence — useful for the "alert budget" discussion in the report.
-SWEEP_THRESHOLDS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 
 
 def confusion(df, pred_col="prediction", label_col="label"):
@@ -161,6 +150,55 @@ def threshold_sweep(probabilities, thresholds, model_name):
         recall = tp / pos_total if pos_total else 0.0
         f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
         rows.append((model_name, float(thr), precision, recall, f1, alerts))
+    return rows
+
+
+def value_sweep_rule_baseline(scored, model_name):
+    """Per-currency dollar recovery for the binary rule alert.
+
+    The rule baseline produces a single fixed alert (no probability),
+    so there is no threshold sweep — just one row per currency. To
+    keep it in the same `eval_value_sweep` table as the ML models,
+    we emit each row with the sentinel threshold value 1.0.
+
+    `scored` must carry the columns `label`, `rule_alert`,
+    `amount_paid`, `payment_currency` (all already present in the
+    features table the rule baseline is computed on).
+    """
+    bucketed = scored.withColumn(
+        "currency_bucket",
+        F.when(F.col("payment_currency").isin(*VALUE_TOP_CURRENCIES),
+               F.col("payment_currency"))
+         .otherwise(F.lit("Other")),
+    )
+    grouped = bucketed.groupBy("currency_bucket").agg(
+        F.sum(F.when(F.col("label") == 1, F.col("amount_paid")).otherwise(0.0))
+            .alias("pos_value"),
+        F.sum(F.when(
+            (F.col("rule_alert") == 1) & (F.col("label") == 1),
+            F.col("amount_paid"),
+        ).otherwise(0.0)).alias("tp_val"),
+        F.sum(F.when(
+            (F.col("rule_alert") == 1) & (F.col("label") == 0),
+            F.col("amount_paid"),
+        ).otherwise(0.0)).alias("fp_val"),
+        F.sum((F.col("rule_alert") == 1).cast("long")).alias("alerts"),
+    ).collect()
+
+    rows = []
+    for row in grouped:
+        currency = row["currency_bucket"]
+        pos_value = float(row["pos_value"] or 0.0)
+        tp_val = float(row["tp_val"] or 0.0)
+        fp_val = float(row["fp_val"] or 0.0)
+        alerts = int(row["alerts"] or 0)
+        value_recall = tp_val / pos_value if pos_value > 0 else 0.0
+        denom = tp_val + fp_val
+        value_precision = tp_val / denom if denom > 0 else 0.0
+        rows.append((
+            model_name, 1.0, currency, pos_value, tp_val, fp_val,
+            value_recall, value_precision, alerts,
+        ))
     return rows
 
 
@@ -323,61 +361,6 @@ def weekend_weekday_breakdown(predictions, model_name):
     return rows
 
 
-def at_fixed_recall(probabilities, target_recalls, model_name):
-    """For each target recall, find the smallest threshold whose actual
-    test-set recall meets or exceeds the target, and report the resulting
-    alert volume + precision.
-
-    Approach: collect only the positives (~tens of thousands of rows at
-    HI-Medium scale) to the driver, sort by `proba_positive` descending,
-    and pick the row whose 1-indexed rank equals ceil(target * n_pos).
-    That row's probability is the threshold to use; we then count alerts
-    and true positives on the full probabilities table.
-
-    Collecting positives to the driver is safe here -- the count is bounded
-    by the laundering-rate (~1:1021 * test size), which is in the low
-    tens of thousands even on HI-Medium.
-    """
-    import math
-
-    pos_pdf = (probabilities
-               .filter(F.col("label") == 1)
-               .select("proba_positive")
-               .toPandas()
-               .sort_values("proba_positive", ascending=False)
-               .reset_index(drop=True))
-    n_pos = len(pos_pdf)
-
-    if n_pos == 0:
-        return [
-            (model_name, float(t), 0.0, 0, 0, 0.0, 0.0)
-            for t in target_recalls
-        ]
-
-    rows = []
-    for target in target_recalls:
-        # Smallest k such that k / n_pos >= target.
-        k = max(1, math.ceil(target * n_pos))
-        k = min(k, n_pos)
-        threshold = float(pos_pdf.iloc[k - 1]["proba_positive"])
-        # Count all alerts and true positives at this threshold.
-        stats = (probabilities.agg(
-            F.sum((F.col("proba_positive") >= threshold).cast("long"))
-              .alias("alerts"),
-            F.sum(((F.col("proba_positive") >= threshold) & (F.col("label") == 1))
-                  .cast("long")).alias("tp"),
-        ).collect()[0])
-        alerts = int(stats["alerts"] or 0)
-        tp = int(stats["tp"] or 0)
-        actual_recall = tp / n_pos if n_pos > 0 else 0.0
-        precision = tp / alerts if alerts > 0 else 0.0
-        rows.append((
-            model_name, float(target), threshold, alerts, tp,
-            actual_recall, precision,
-        ))
-    return rows
-
-
 def main():
     spark = build_session("evaluate_models")
 
@@ -427,23 +410,48 @@ def main():
         rawPredictionCol="rawPrediction",
         metricName="areaUnderPR",
     )
-    for name, path, cls, _ in MODELS:
+    # Read every model's pinned threshold up front so both this loop and
+    # the downstream sweep loop use the same operating point per model.
+    pinned_thresholds = {}
+    for name, _path, _cls, model_dir in MODELS:
+        pinned_path = f"project/output/{model_dir}_pinned_threshold"
+        pinned_row = (spark.read
+                      .option("header", "true")
+                      .option("inferSchema", "true")
+                      .csv(pinned_path)
+                      .first())
+        pinned_thresholds[name] = float(pinned_row["pinned_threshold"])
+        print(f"[evaluate] {name}: pinned threshold = "
+              f"{pinned_thresholds[name]:.2f}")
+
+    for name, path, cls, model_dir in MODELS:
         print(f"[evaluate] loading {name} from {path}")
         model = cls.load(path)
-        # Score once; project to the columns the four downstream calls need.
+        pinned_threshold = pinned_thresholds[name]
+
+        # Score once; binarise at the pinned threshold instead of the model's
+        # default 0.5 — the headline evaluation.csv row reports on test at the
+        # operating point chosen on the calibration slice.
         predictions = (
             model.transform(test)
+                 .withColumn(
+                     "prediction_pinned",
+                     (vector_to_array("probability")[1] >= pinned_threshold)
+                         .cast("int"),
+                 )
                  .select(
-                     "label", "prediction", "probability", "rawPrediction",
+                     "label", "prediction_pinned", "probability", "rawPrediction",
                      "is_weekend",
                      "from_account", "to_account", "ts_unix",
                  )
+                 .withColumnRenamed("prediction_pinned", "prediction")
                  .cache()
         )
 
         pr_auc = binary_evaluator.evaluate(predictions)
         precision, recall, f1, alerts = confusion(predictions)
-        print(f"[evaluate] {name}  P={precision:.4f}  R={recall:.4f}  "
+        print(f"[evaluate] {name}  thr={pinned_threshold:.2f}  "
+              f"P={precision:.4f}  R={recall:.4f}  "
               f"F1={f1:.4f}  PR-AUC={pr_auc:.4f}  alerts={alerts:,}")
         rows.append((name, precision, recall, f1, pr_auc, alerts))
 
@@ -496,47 +504,57 @@ def main():
     out.show(truncate=False)
 
     # -------------------------------------------------------------------------
-    # 5. Threshold sweep — read each ML model's probabilities table (written
-    #    by train_models.py step 9) and compute (precision, recall, f1, alerts)
-    #    at multiple cutoffs in a single scan per model. This gives the report
-    #    the operating-point curve that the rule baseline can't produce.
-    #    The same probabilities table is reused for the value sweep in step 6,
-    #    so we cache it once and unpersist after both sweeps run.
+    # 5. Pinned-threshold evaluation — read each ML model's probabilities
+    #    table (written by train_models.py step 9) and compute precision,
+    #    recall, F1, alert volume and the per-currency dollar recovery at
+    #    the model's pinned threshold (from the calibration tail of
+    #    training). No sweep — the pinned threshold is the production
+    #    operating point and is used everywhere downstream.
     # -------------------------------------------------------------------------
     sweep_rows = []
     value_sweep_rows = []
-    fixed_recall_rows = []
     for name, _path, _cls, model_dir in MODELS:
+        pinned_threshold = pinned_thresholds[name]
         prob_path = f"project/output/{model_dir}_probabilities"
-        print(f"[evaluate] reading probabilities for {name} from {prob_path}")
+        print(f"[evaluate] reading probabilities for {name} from {prob_path} "
+              f"(pinned threshold {pinned_threshold:.2f})")
         probs = (spark.read
                  .option("header", "true")
                  .option("inferSchema", "true")
                  .csv(prob_path)
                  .cache())
-        model_sweep = threshold_sweep(probs, SWEEP_THRESHOLDS, name)
+        model_sweep = threshold_sweep(probs, [pinned_threshold], name)
         for r in model_sweep:
             print(f"[evaluate]   thr={r[1]:.2f}  P={r[2]:.4f}  R={r[3]:.4f}  "
                   f"F1={r[4]:.4f}  alerts={r[5]:,}")
         sweep_rows.extend(model_sweep)
 
-        # Value sweep on the same cached probabilities.
-        model_value = value_sweep(probs, SWEEP_THRESHOLDS, name)
+        model_value = value_sweep(probs, [pinned_threshold], name)
         for r in model_value:
             print(f"[evaluate]   val/{r[2]:<18s} thr={r[1]:.2f}  "
                   f"vR={r[6]:.4f}  vP={r[7]:.4f}  "
                   f"detected={r[4]:,.0f}  alerts={r[8]:,}")
         value_sweep_rows.extend(model_value)
 
-        # Fixed-recall operating points (same cached probabilities).
-        model_fixed = at_fixed_recall(probs, FIXED_RECALL_TARGETS, name)
-        for r in model_fixed:
-            print(f"[evaluate]   fixedR={r[1]:.2f}  thr={r[2]:.4f}  "
-                  f"alerts={r[3]:,}  tp={r[4]:,}  "
-                  f"actualR={r[5]:.4f}  P={r[6]:.4f}")
-        fixed_recall_rows.extend(model_fixed)
-
         probs.unpersist()
+
+    # -------------------------------------------------------------------------
+    # 5b. Rule baseline value rows — one per currency, threshold=1.0 sentinel.
+    #     Computed here (not in rule_baseline.py) so all three detectors land
+    #     in the same eval_value_sweep table and on the same dashboard plot,
+    #     without an extra staging CSV.
+    # -------------------------------------------------------------------------
+    from rule_baseline import apply_rules, compute_test_split  # local import
+    print("[evaluate] computing rule-baseline per-currency value rows")
+    rule_scored = (apply_rules(compute_test_split(spark))
+                   .select("label", "rule_alert", "amount_paid",
+                           "payment_currency"))
+    rule_value = value_sweep_rule_baseline(rule_scored, "rule_baseline_R1_R2_R5")
+    for r in rule_value:
+        print(f"[evaluate]   val/{r[2]:<18s} rule   "
+              f"vR={r[6]:.4f}  vP={r[7]:.4f}  "
+              f"detected={r[4]:,.0f}  alerts={r[8]:,}")
+    value_sweep_rows.extend(rule_value)
 
     sweep = spark.createDataFrame(
         sweep_rows,
@@ -664,37 +682,10 @@ def main():
             TBLPROPERTIES ('skip.header.line.count'='1')"""
     )
 
-    # -------------------------------------------------------------------------
-    # 9. Fixed-recall operating points — for each target recall, the
-    #    smallest threshold meeting it, plus the resulting alert volume
-    #    and precision. One row per (model, target_recall).
-    # -------------------------------------------------------------------------
-    fr_df = spark.createDataFrame(
-        fixed_recall_rows,
-        schema="model string, target_recall double, threshold double, "
-               "alerts long, tp long, actual_recall double, precision double",
-    )
-    print(f"[evaluate] writing fixed-recall table -> {HDFS_FIXED_RECALL}")
-    (fr_df.coalesce(1)
-        .write.mode("overwrite")
-        .option("header", "true")
-        .csv(HDFS_FIXED_RECALL))
-    spark.sql(f"DROP TABLE IF EXISTS {FIXED_RECALL_TABLE}")
-    spark.sql(
-        f"""CREATE EXTERNAL TABLE {FIXED_RECALL_TABLE} (
-                model         STRING,
-                target_recall DOUBLE,
-                threshold     DOUBLE,
-                alerts        BIGINT,
-                tp            BIGINT,
-                actual_recall DOUBLE,
-                precision     DOUBLE
-            )
-            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-            STORED AS TEXTFILE
-            LOCATION '{HDFS_FIXED_RECALL}'
-            TBLPROPERTIES ('skip.header.line.count'='1')"""
-    )
+    # The fixed-recall operating-points table was useful while the
+    # evaluation reported a curve. With the pinned-threshold regime the
+    # operating point is fixed per model, so a per-recall-target table
+    # would duplicate that single row. Dropped on purpose.
 
     spark.stop()
 

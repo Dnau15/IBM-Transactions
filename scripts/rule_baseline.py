@@ -22,6 +22,11 @@ which are split-independent).
 
 Output (HDFS): project/output/rule_baseline
               one-row CSV: model,precision,recall,f1,pr_auc,alert_volume
+
+The rule baseline's per-currency dollar recovery is folded into the
+single eval_value_sweep table by evaluate_models.py (one row per
+currency, threshold=1.0 as a sentinel), so the rule sits next to the
+ML models on the same plot and in the same Hive table.
 """
 import sys
 

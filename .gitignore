@@ -5,6 +5,7 @@ secrets/*
 .DS_Store
 data/*
 output/*
+presentation/*
 !data/.gitkeep
 docs/
 dashboard_example/

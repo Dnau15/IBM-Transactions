@@ -55,4 +55,26 @@ if [[ "${RUN_PLOTS:-1}" == "1" && "${SKIP_PLOTS:-0}" != "1" ]]; then
     fi
 fi
 
+# -----------------------------------------------------------------------------
+# Pylint — Stage II rubric line item ("Check the quality of scripts in this
+# stage using pylint command"). Same fail-soft pattern as stage1.sh and
+# stage3.sh: report findings, do not abort the build.
+# -----------------------------------------------------------------------------
+if [[ "${SKIP_PYLINT:-0}" != "1" ]]; then
+    echo "============================================================"
+    echo "[stage2] pylint scripts"
+    echo "============================================================"
+    if command -v pylint >/dev/null 2>&1; then
+        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        mkdir -p "${REPO_ROOT}/output"
+        pylint --rcfile="${REPO_ROOT}/.pylintrc" --exit-zero \
+            "${REPO_ROOT}/scripts/load_accounts.py" \
+            "${REPO_ROOT}/scripts/eda_plot.py" \
+            | tee "${REPO_ROOT}/output/pylint_stage2.txt"
+        echo "[stage2] -> output/pylint_stage2.txt"
+    else
+        echo "[stage2] pylint not installed; skipping (install with: pip install --user pylint)"
+    fi
+fi
+
 echo "[stage2] done."

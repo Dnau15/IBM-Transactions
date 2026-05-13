@@ -58,6 +58,27 @@ CV_FOLDS = 3
 # Reproducibility.
 SEED = 42
 
+# -- Calibration tail (threshold tuning) -------------------------------------
+# Chronological last 10% of the training slice is reserved as a calibration
+# tail: the CV (and the saved model) only see the first 90% of training.
+# After CV picks the best hyperparameters, the same fitted model scores
+# calibration; we pick the threshold that maximises USD recovered subject
+# to a fixed alerts/day cap, and pin it. evaluate_models.py uses that
+# threshold (not 0.5) when reporting on test. There is no refit step —
+# the model that produced calibration scores is the model that scores
+# test, so the pinned threshold is faithful.
+CALIBRATION_FRACTION = 0.10
+
+# Alert budget for threshold pinning, in alerts per calendar day on the
+# calibration slice. ~5k alerts/day is in line with a 10-analyst roster
+# clearing ~1 alert per hour. Tune to match the production review capacity.
+ALERT_BUDGET_PER_DAY = 5000
+
+# Grid of probability cutoffs swept on calibration. 0.05 increments
+# resolve the pin to within ~half a step of the true optimum, which is
+# well below the ±8% alert-volume noise the calibration slice imposes.
+CALIBRATION_THRESHOLDS = [i / 100.0 for i in range(5, 100, 5)]
+
 
 # -----------------------------------------------------------------------------
 # Class-imbalance handling
@@ -200,10 +221,30 @@ def main():
     spark = build_session(f"train_{args.model}")
 
     # 1. Load splits (Parquet preserves the features Vector type).
-    train = spark.read.parquet(HDFS_TRAIN)
+    train_full = spark.read.parquet(HDFS_TRAIN)
     test = spark.read.parquet(HDFS_TEST)
 
-    # 2. Downsample negatives + attach class weights on train only, then
+    # 1b. Carve the chronological last 10% of training as the calibration tail.
+    #     The CV (and the saved model) only see the first 90% of training.
+    #     Calibration is later used to pin the production threshold without
+    #     ever being shown to the model — no refit, no model-vs-threshold
+    #     shift. Test stays untouched.
+    (cal_cutoff,) = train_full.approxQuantile(
+        "ts_unix", [1.0 - CALIBRATION_FRACTION], 0.001
+    )
+    print(
+        f"[train_models] calibration cutoff ts_unix = {int(cal_cutoff)}  "
+        f"(last {CALIBRATION_FRACTION:.0%} of training reserved for threshold tuning)"
+    )
+    train = train_full.filter(F.col("ts_unix") <= cal_cutoff)
+    calibration_raw = (
+        train_full.filter(F.col("ts_unix") > cal_cutoff)
+        .persist(StorageLevel.MEMORY_AND_DISK)
+    )
+    n_cal = calibration_raw.count()
+    print(f"[train_models] calibration rows = {n_cal:,}")
+
+    # 2. Downsample negatives + attach class weights on inner-train only, then
     #    repartition to 2× executor cores (15 cores → 30 partitions) so CV
     #    inner stages run in two clean waves of 15 tasks instead of leaving
     #    cores idle on a single tail wave. Cache because CV does
@@ -288,6 +329,107 @@ def main():
 
     # Release the cached train set — the rest of main only touches test.
     train_balanced.unpersist()
+
+    # 5c. Pin the production threshold on the calibration tail.
+    #     Score calibration with the best CV model, sweep probability
+    #     cutoffs, and pick the one that maximises USD recovered subject
+    #     to the alerts/day cap. evaluate_models.py reads this CSV and
+    #     reports on test at this threshold (not 0.5).
+    print(f"[train_models] {args.model}: scoring calibration tail")
+    cal_scored = (
+        best.transform(calibration_raw)
+        .select(
+            F.col("label").cast("int").alias("label"),
+            vector_to_array("probability")[1].alias("proba_positive"),
+            F.col("amount_paid").cast("double").alias("amount_paid"),
+            F.col("ts_unix").cast("long").alias("ts_unix"),
+        )
+        .persist(StorageLevel.MEMORY_AND_DISK)
+    )
+
+    ts_min, ts_max = cal_scored.agg(
+        F.min("ts_unix"), F.max("ts_unix")
+    ).collect()[0]
+    cal_days = max(float((ts_max - ts_min) / 86400.0), 1.0)
+    budget_alerts = int(cal_days * ALERT_BUDGET_PER_DAY)
+    print(
+        f"[train_models] {args.model}: calibration span {cal_days:.2f} days, "
+        f"alert budget = {budget_alerts:,} ({ALERT_BUDGET_PER_DAY:,}/day)"
+    )
+
+    # Single scan over calibration: aggregate (alerts, TP USD) per threshold.
+    agg_cols = [
+        F.sum(F.when(F.col("label") == 1, F.col("amount_paid")).otherwise(0.0))
+            .alias("pos_value"),
+    ]
+    for thr in CALIBRATION_THRESHOLDS:
+        key = int(round(thr * 100))
+        agg_cols.append(
+            F.sum(F.when(
+                (F.col("proba_positive") >= thr) & (F.col("label") == 1),
+                F.col("amount_paid"),
+            ).otherwise(0.0)).alias(f"tp_val_{key}")
+        )
+        agg_cols.append(
+            F.sum((F.col("proba_positive") >= thr).cast("long"))
+                .alias(f"alerts_{key}")
+        )
+    cal_agg = cal_scored.agg(*agg_cols).collect()[0]
+    pos_value = float(cal_agg["pos_value"] or 0.0)
+
+    # Pick max USD-recovered subject to alerts <= budget; tie-break by
+    # higher threshold (smaller alert volume).
+    best_thr = None
+    best_usd = -1.0
+    best_alerts = None
+    for thr in CALIBRATION_THRESHOLDS:
+        key = int(round(thr * 100))
+        tp_val = float(cal_agg[f"tp_val_{key}"] or 0.0)
+        alerts = int(cal_agg[f"alerts_{key}"] or 0)
+        if alerts <= budget_alerts:
+            if (tp_val > best_usd) or (tp_val == best_usd and thr > (best_thr or 0)):
+                best_thr = thr
+                best_usd = tp_val
+                best_alerts = alerts
+    if best_thr is None:
+        # No threshold meets the budget — pin the tightest one (fewest alerts).
+        best_thr = CALIBRATION_THRESHOLDS[-1]
+        key = int(round(best_thr * 100))
+        best_usd = float(cal_agg[f"tp_val_{key}"] or 0.0)
+        best_alerts = int(cal_agg[f"alerts_{key}"] or 0)
+        print(
+            f"[train_models] {args.model}: no threshold satisfies the budget; "
+            f"pinning at {best_thr:.2f} (alerts {best_alerts:,})"
+        )
+    else:
+        print(
+            f"[train_models] {args.model}: pinned threshold = {best_thr:.2f}  "
+            f"USD recovered = ${best_usd/1e9:.2f}B  alerts = {best_alerts:,}"
+        )
+
+    pinned_path = f"project/output/{model_dir}_pinned_threshold"
+    print(f"[train_models] {args.model}: saving pinned threshold -> {pinned_path}")
+    pinned_df = spark.createDataFrame(
+        [(
+            args.model,
+            float(best_thr),
+            float(cal_days),
+            int(best_alerts or 0),
+            float(best_usd),
+            float(best_usd / pos_value if pos_value > 0 else 0.0),
+            int(ALERT_BUDGET_PER_DAY),
+        )],
+        schema=("model string, pinned_threshold double, calibration_days double, "
+                "calibration_alerts long, calibration_usd_recovered double, "
+                "calibration_value_recall double, alert_budget_per_day long"),
+    )
+    (pinned_df.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(pinned_path))
+
+    cal_scored.unpersist()
+    calibration_raw.unpersist()
 
     # 6. Save best model. The CrossValidatorModel itself is not persisted —
     #    only the best fitted estimator, which is what evaluate_models.py loads.

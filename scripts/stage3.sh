@@ -191,7 +191,8 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_value_sweep" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_pattern_recall" || true
     hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_weekend_weekday" || true
-    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/eval_at_fixed_recall" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model1_pinned_threshold" || true
+    hdfs dfs -rm -r -f -skipTrash "${HDFS_USER}/project/output/model2_pinned_threshold" || true
 
     "${SPARK_SUBMIT[@]}" --py-files "$PY_FILES" scripts/evaluate_models.py
 fi
@@ -306,15 +307,18 @@ if [[ "${SKIP_PULL:-0}" != "1" ]]; then
     echo "[stage3] -> output/eval_weekend_weekday.csv"
     cat output/eval_weekend_weekday.csv
 
-    # 5g. Alert-volume-at-fixed-recall (ml.md §6 operational metric).
-    #     One row per (model, target_recall ∈ {0.5, 0.7, 0.9}).
-    rm -f output/eval_at_fixed_recall.csv
-    echo "model,target_recall,threshold,alerts,tp,actual_recall,precision" \
-        > output/eval_at_fixed_recall.csv
-    hdfs dfs -cat "${HDFS_USER}/project/output/eval_at_fixed_recall/part-*.csv" \
-        2>/dev/null | tail -n +2 >> output/eval_at_fixed_recall.csv || true
-    echo "[stage3] -> output/eval_at_fixed_recall.csv"
-    cat output/eval_at_fixed_recall.csv
+    # 5g. Pinned-threshold CSV per model — written by train_models.py on
+    #     the calibration tail of training; evaluate_models.py reports every
+    #     downstream metric at this threshold.
+    for m in model1 model2; do
+        rm -f "output/${m}_pinned_threshold.csv"
+        echo "model,pinned_threshold,calibration_days,calibration_alerts,calibration_usd_recovered,calibration_value_recall,alert_budget_per_day" \
+            > "output/${m}_pinned_threshold.csv"
+        hdfs dfs -cat "${HDFS_USER}/project/output/${m}_pinned_threshold/part-*.csv" \
+            2>/dev/null | tail -n +2 >> "output/${m}_pinned_threshold.csv" || true
+        echo "[stage3] -> output/${m}_pinned_threshold.csv"
+        cat "output/${m}_pinned_threshold.csv"
+    done
 fi
 
 # -----------------------------------------------------------------------------
